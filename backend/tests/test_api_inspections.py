@@ -54,6 +54,9 @@ def test_create_and_process_inspection_end_to_end(
     assert final_inspection["status"] == "completed", f"Failed with: {final_inspection.get('failure_message')}"
     assert final_inspection["point_count"] > 0
     assert final_inspection["point_cloud_url"] is not None
+    assert final_inspection["mesh_url"] is not None
+    assert final_inspection["triangle_count"] is not None and final_inspection["triangle_count"] > 0
+    assert final_inspection["mesh_status"] == "completed"
     assert final_inspection["findings"] == []  # Milestone 1: no fabricated findings
 
     # 3. Retrieve pointcloud.ply artifact
@@ -61,10 +64,75 @@ def test_create_and_process_inspection_end_to_end(
     assert artifact_res.status_code == 200
     assert b"format binary_little_endian 1.0" in artifact_res.content
 
-    # 4. Retrieve disparity_vis.png artifact
+    # 4. Retrieve mesh.ply artifact
+    mesh_res = test_client.get(f"/api/inspections/{inspection_id}/artifacts/mesh.ply")
+    assert mesh_res.status_code == 200
+    assert len(mesh_res.content) > 0
+
+    # 5. Retrieve disparity_vis.png artifact
     vis_res = test_client.get(f"/api/inspections/{inspection_id}/artifacts/disparity_vis.png")
     assert vis_res.status_code == 200
     assert vis_res.headers["content-type"] == "image/png"
+
+
+def test_inspection_with_mesh_failure_preserves_point_cloud(
+    monkeypatch,
+    test_client: TestClient,
+    synthetic_stereo_pair,
+    valid_rectified_calib_json,
+):
+    """
+    Verifies that when surface mesh generation encounters an exception,
+    the inspection completes with status 'completed', pointcloud.ply is preserved,
+    mesh_status is 'failed', and GET /artifacts/mesh.ply yields 404.
+    """
+    def mock_failing_mesh(*args, **kwargs):
+        raise RuntimeError("Injected Poisson failure for API testing")
+
+    import app.pipeline.runner as runner_mod
+    monkeypatch.setattr(runner_mod, "reconstruct_surface_mesh", mock_failing_mesh)
+
+    files = {
+        "left_image": ("left.png", synthetic_stereo_pair["left_bytes"], "image/png"),
+        "right_image": ("right.png", synthetic_stereo_pair["right_bytes"], "image/png"),
+        "calibration_file": ("calibration.json", valid_rectified_calib_json.encode("utf-8"), "application/json"),
+    }
+    data = {
+        "name": "Mesh Failure Degradation Test",
+        "surface_type": "Concrete surface",
+    }
+
+    res = test_client.post("/api/inspections", data=data, files=files)
+    assert res.status_code == 201
+    inspection_id = res.json()["id"]
+
+    # Poll until completed
+    max_wait = 10
+    start = time.time()
+    final_data = None
+    while time.time() - start < max_wait:
+        poll_res = test_client.get(f"/api/inspections/{inspection_id}")
+        if poll_res.json()["status"] in ["completed", "failed"]:
+            final_data = poll_res.json()
+            break
+        time.sleep(0.3)
+
+    assert final_data is not None
+    assert final_data["status"] == "completed"
+    assert final_data["point_count"] > 0
+    assert final_data["point_cloud_url"] is not None
+    assert final_data["mesh_url"] is None
+    assert final_data["triangle_count"] is None
+    assert final_data["mesh_status"] == "failed"
+    assert "Injected Poisson failure" in final_data["mesh_error"]
+
+    # Point cloud must be downloadable
+    pc_res = test_client.get(f"/api/inspections/{inspection_id}/artifacts/pointcloud.ply")
+    assert pc_res.status_code == 200
+
+    # Mesh artifact must return 404
+    mesh_res = test_client.get(f"/api/inspections/{inspection_id}/artifacts/mesh.ply")
+    assert mesh_res.status_code == 404
 
 
 def test_upload_missing_calibration(test_client: TestClient, synthetic_stereo_pair):

@@ -63,6 +63,7 @@ def run_poisson_reconstruction(
     k_neighbors: int = 30,
     scale: float = 1.1,
     linear_fit: bool = False,
+    n_threads: int = 1,
     output_display_ply_path: Optional[Path] = None,
     max_display_triangles: int = 3_000_000
 ) -> Dict[str, Any]:
@@ -110,7 +111,8 @@ def run_poisson_reconstruction(
         pcd,
         depth=octree_depth,
         scale=float(scale),
-        linear_fit=bool(linear_fit)
+        linear_fit=bool(linear_fit),
+        n_threads=int(n_threads)
     )
 
     if len(mesh.vertices) == 0 or len(mesh.triangles) == 0:

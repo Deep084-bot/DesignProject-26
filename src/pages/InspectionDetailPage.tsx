@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useParams, Link } from 'react-router-dom';
-import { ArrowLeft, Box, Calendar, Server, PlayCircle } from 'lucide-react';
+import { ArrowLeft, Box, Calendar, Server, PlayCircle, Download } from 'lucide-react';
 import { fetchInspectionById } from '../services/api';
 import type { Inspection } from '../types/inspection';
 import { ThreeSurfaceViewer } from '../components/viewer/ThreeSurfaceViewer';
@@ -138,10 +138,58 @@ export const InspectionDetailPage: React.FC = () => {
         <div className="lg:col-span-8 space-y-4">
           <ThreeSurfaceViewer
             plyUrl={inspection.pointCloudUrl}
+            meshUrl={inspection.meshUrl}
+            meshStatus={inspection.meshStatus}
+            meshError={inspection.meshError}
             findings={inspection.findings}
             selectedFindingId={selectedFindingId}
             isDemoModel={inspection.isDemoMode}
           />
+
+          {/* Artifact Download & Geometry Action Strip */}
+          {(inspection.meshUrl || inspection.pointCloudUrl || inspection.meshStatus === 'failed') && (
+            <div className="flex flex-wrap items-center justify-between gap-3 p-3 rounded-xl bg-white border border-[#E8E5DC] text-xs shadow-[0_1px_3px_rgba(0,0,0,0.02)]">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="font-semibold text-[#343832] uppercase tracking-wider text-[11px]">Artifacts:</span>
+                <span className="text-[#777D73] font-mono text-[11px]">
+                  {inspection.triangleCount ? `${inspection.triangleCount.toLocaleString()} triangles` : ''}
+                  {inspection.triangleCount && inspection.pointCount ? ' • ' : ''}
+                  {inspection.pointCount ? `${inspection.pointCount.toLocaleString()} points` : ''}
+                </span>
+
+                {inspection.meshStatus === 'failed' && (
+                  <span
+                    className="inline-flex items-center text-[10px] text-[#8F543E] bg-[#FBF0EC] px-2 py-0.5 rounded border border-[#EACEC5]"
+                    title={inspection.meshError || 'Surface mesh reconstruction failed'}
+                  >
+                    Mesh reconstruction unavailable
+                  </span>
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                {inspection.meshUrl && (
+                  <a
+                    href={inspection.meshUrl}
+                    download={`${inspection.id}_mesh.ply`}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-medium bg-[#E7EDE4] text-[#3F513D] hover:bg-[#d5e0d1] border border-[#D5E0D1] transition-colors"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    <span>Surface Mesh (.ply)</span>
+                  </a>
+                )}
+                {inspection.pointCloudUrl && (
+                  <a
+                    href={inspection.pointCloudUrl}
+                    download={`${inspection.id}_pointcloud.ply`}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-medium bg-[#F0EFE8] text-[#343832] hover:bg-[#e4e1d7] border border-[#E8E5DC] transition-colors"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    <span>Point Cloud (.ply)</span>
+                  </a>
+                )}
+              </div>
+            </div>
+          )}
 
           {/* Quick Summary Strip */}
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">

@@ -188,6 +188,14 @@ class JobManager:
                 job.current_step_index = 5
                 job.point_count = result.point_count
                 job.point_cloud_url = f"/api/inspections/{inspection_id}/artifacts/pointcloud.ply"
+                job.mesh_status = result.mesh_status
+                job.mesh_error = result.mesh_error
+                if result.mesh_path and result.mesh_path.exists():
+                    job.mesh_url = f"/api/inspections/{inspection_id}/artifacts/mesh.ply"
+                    job.triangle_count = result.triangle_count
+                else:
+                    job.mesh_url = None
+                    job.triangle_count = None
                 job.failure_message = None
                 # Milestone 1: findings list remains empty [] (no fabricated defects)
                 job.findings = []

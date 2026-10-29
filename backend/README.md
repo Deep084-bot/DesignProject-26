@@ -9,6 +9,7 @@ This is the Python photogrammetry processing backend for Surface. It accepts cal
 - **Framework**: FastAPI (asynchronous ASGI web server)
 - **Server**: Uvicorn
 - **Image & Stereo Processing**: OpenCV (`opencv-python-headless`)
+- **Surface Mesh Reconstruction**: Open3D (`open3d`) & SciPy (`scipy`) — Poisson Surface Reconstruction (`PointCloudToMesh`)
 - **Numerical Computations**: NumPy
 - **Validation**: Pydantic v2
 - **Testing**: Pytest & HTTPX TestClient
@@ -120,9 +121,10 @@ Inputs are strictly rejected with HTTP 400 Bad Request if:
 
 ---
 
-## PLY Point Cloud Artifact Format
+## 3D Artifact Formats: Point Cloud & Surface Mesh
 
-Artifacts are saved as standard binary little-endian PLY 1.0 files (`pointcloud.ply`):
+### 1. Point Cloud Artifact (`pointcloud.ply`)
+Saved as standard binary little-endian PLY 1.0 containing unindexed coordinates and RGB colors:
 ```
 ply
 format binary_little_endian 1.0
@@ -135,9 +137,28 @@ property uchar red
 property uchar green
 property uchar blue
 end_header
-<binary structured vertex data: 15 bytes per point>
 ```
-Fully compatible with Three.js `PLYLoader`.
+
+### 2. Poisson Surface Mesh Artifact (`mesh.ply`)
+Generated via Poisson Surface Reconstruction (Satyam's `PointCloudToMesh` integration). Produces an indexed triangular surface manifold with smooth vertex normals and transferred vertex colors:
+```
+ply
+format binary_little_endian 1.0
+element vertex <V>
+property float x
+property float y
+property float z
+property float nx
+property float ny
+property float nz
+property uchar red
+property uchar green
+property uchar blue
+element face <F>
+property list uchar int vertex_indices
+end_header
+```
+Both artifacts are served directly by the backend and rendered in the frontend Three.js viewer with interactive toggling between **Surface Mesh**, **Point Cloud**, and **Wireframe**.
 
 ---
 

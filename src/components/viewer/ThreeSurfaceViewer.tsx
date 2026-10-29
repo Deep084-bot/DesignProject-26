@@ -6,8 +6,13 @@ import { RotateCcw, Eye, EyeOff, Box } from 'lucide-react';
 import type { Finding } from '../../types/inspection';
 import { resolveArtifactUrl } from '../../services/api';
 
+export type RenderMode = 'mesh' | 'points' | 'wireframe';
+
 interface ThreeSurfaceViewerProps {
   plyUrl?: string;
+  meshUrl?: string;
+  meshStatus?: 'completed' | 'failed' | 'unavailable' | string;
+  meshError?: string;
   findings?: Finding[];
   selectedFindingId?: string | null;
   isDemoModel?: boolean;
@@ -15,18 +20,28 @@ interface ThreeSurfaceViewerProps {
 
 export const ThreeSurfaceViewer: React.FC<ThreeSurfaceViewerProps> = ({
   plyUrl,
+  meshUrl,
+  meshStatus,
+  meshError,
   findings = [],
   selectedFindingId = null,
   isDemoModel = false,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
-  const [loading, setLoading] = useState(Boolean(plyUrl));
+  const activeUrl = meshUrl || plyUrl;
+  const [loading, setLoading] = useState(Boolean(activeUrl));
   const [error, setError] = useState<string | null>(null);
   const [pointCount, setPointCount] = useState<number | null>(null);
+  const [triangleCount, setTriangleCount] = useState<number | null>(null);
   const [showGrid, setShowGrid] = useState<boolean>(true);
   const [showHeatmap, setShowHeatmap] = useState<boolean>(false);
   const [hasDeviationData, setHasDeviationData] = useState<boolean>(false);
   const [isSampleGeometry, setIsSampleGeometry] = useState<boolean>(false);
+  const [renderMode, setRenderMode] = useState<RenderMode>(meshUrl ? 'mesh' : 'points');
+  const renderModeRef = useRef<RenderMode>(renderMode);
+  useEffect(() => {
+    renderModeRef.current = renderMode;
+  }, [renderMode]);
   const pointSize = 3.5;
 
   // Internal Three.js references
@@ -35,15 +50,17 @@ export const ThreeSurfaceViewer: React.FC<ThreeSurfaceViewerProps> = ({
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const controlsRef = useRef<OrbitControls | null>(null);
   const pointsObjectRef = useRef<THREE.Points | null>(null);
+  const meshObjectRef = useRef<THREE.Mesh | null>(null);
+  const wireframeObjectRef = useRef<THREE.Mesh | null>(null);
   const originalColorsRef = useRef<THREE.BufferAttribute | null>(null);
   const highlightGroupRef = useRef<THREE.Group | null>(null);
   const initialCameraPosRef = useRef<THREE.Vector3>(new THREE.Vector3(0, 0, 800));
 
   // Resolved URL pointing to backend or local sample
-  const resolvedPlyUrl = resolveArtifactUrl(plyUrl);
+  const resolvedActiveUrl = resolveArtifactUrl(activeUrl);
 
   useEffect(() => {
-    if (!resolvedPlyUrl) return;
+    if (!resolvedActiveUrl) return;
 
     const container = containerRef.current;
     if (!container) return;
@@ -82,10 +99,10 @@ export const ThreeSurfaceViewer: React.FC<ThreeSurfaceViewerProps> = ({
     controlsRef.current = controls;
 
     // 5. Lighting
-    const ambientLight = new THREE.AmbientLight(0xffffff, 0.85);
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.9);
     scene.add(ambientLight);
 
-    const dirLight1 = new THREE.DirectionalLight(0xffffff, 0.75);
+    const dirLight1 = new THREE.DirectionalLight(0xffffff, 0.7);
     dirLight1.position.set(200, 300, 400);
     scene.add(dirLight1);
 
@@ -109,12 +126,12 @@ export const ThreeSurfaceViewer: React.FC<ThreeSurfaceViewerProps> = ({
     setLoading(true);
     setError(null);
 
-    const isSample = Boolean(isDemoModel || resolvedPlyUrl.includes('concrete_wall_surface.ply'));
+    const isSample = Boolean(isDemoModel || resolvedActiveUrl.includes('concrete_wall_surface.ply'));
     setIsSampleGeometry(isSample);
 
     const loader = new PLYLoader();
     loader.load(
-      resolvedPlyUrl,
+      resolvedActiveUrl,
       (geometry) => {
         geometry.computeVertexNormals();
         geometry.computeBoundingBox();
@@ -127,6 +144,10 @@ export const ThreeSurfaceViewer: React.FC<ThreeSurfaceViewerProps> = ({
 
         const numPoints = geometry.attributes.position ? geometry.attributes.position.count : 0;
         setPointCount(numPoints);
+
+        const hasFaces = Boolean(geometry.index && geometry.index.count > 0);
+        const numTriangles = hasFaces ? geometry.index!.count / 3 : 0;
+        setTriangleCount(numTriangles);
 
         // Check if true deviation scalars exist in the PLY file
         const deviationAttr =
@@ -141,9 +162,10 @@ export const ThreeSurfaceViewer: React.FC<ThreeSurfaceViewerProps> = ({
           originalColorsRef.current = geometry.attributes.color.clone() as THREE.BufferAttribute;
         }
 
-        // Create point cloud material
         const hasColors = Boolean(geometry.attributes.color);
-        const material = new THREE.PointsMaterial({
+
+        // A. Points representation
+        const pointsMaterial = new THREE.PointsMaterial({
           size: pointSize,
           sizeAttenuation: true,
           vertexColors: hasColors,
@@ -151,10 +173,42 @@ export const ThreeSurfaceViewer: React.FC<ThreeSurfaceViewerProps> = ({
           transparent: true,
           opacity: 0.95,
         });
-
-        const points = new THREE.Points(geometry, material);
+        const points = new THREE.Points(geometry, pointsMaterial);
         pointsObjectRef.current = points;
         scene.add(points);
+
+        // B. Solid Mesh representation (if triangular faces exist)
+        if (hasFaces) {
+          const meshMaterial = new THREE.MeshStandardMaterial({
+            vertexColors: hasColors,
+            color: hasColors ? 0xffffff : 0xd8d4cb,
+            roughness: 0.6,
+            metalness: 0.05,
+            side: THREE.DoubleSide,
+          });
+          const mesh = new THREE.Mesh(geometry, meshMaterial);
+          meshObjectRef.current = mesh;
+          scene.add(mesh);
+
+          // C. Wireframe representation
+          const wireframeMaterial = new THREE.MeshBasicMaterial({
+            color: 0x5b7358,
+            wireframe: true,
+            transparent: true,
+            opacity: 0.6,
+          });
+          const wireframe = new THREE.Mesh(geometry, wireframeMaterial);
+          wireframeObjectRef.current = wireframe;
+          scene.add(wireframe);
+
+          // Default visibility based on initial renderMode
+          mesh.visible = renderModeRef.current === 'mesh';
+          wireframe.visible = renderModeRef.current === 'wireframe';
+          points.visible = renderModeRef.current === 'points';
+        } else {
+          points.visible = true;
+          setRenderMode('points');
+        }
 
         // Fit camera to object bounding box
         const maxDim = Math.max(size.x, size.y, size.z);
@@ -174,7 +228,7 @@ export const ThreeSurfaceViewer: React.FC<ThreeSurfaceViewerProps> = ({
       undefined,
       (err) => {
         console.warn('PLY load error:', err);
-        setError('Could not load 3D point cloud file. Please verify the backend artifact URL.');
+        setError('Could not load 3D surface model. Please verify backend artifact connectivity.');
         setLoading(false);
       }
     );
@@ -216,11 +270,40 @@ export const ThreeSurfaceViewer: React.FC<ThreeSurfaceViewerProps> = ({
         }
       }
 
+      if (meshObjectRef.current) {
+        if (Array.isArray(meshObjectRef.current.material)) {
+          meshObjectRef.current.material.forEach((m) => m.dispose());
+        } else {
+          meshObjectRef.current.material.dispose();
+        }
+      }
+
+      if (wireframeObjectRef.current) {
+        if (Array.isArray(wireframeObjectRef.current.material)) {
+          wireframeObjectRef.current.material.forEach((m) => m.dispose());
+        } else {
+          wireframeObjectRef.current.material.dispose();
+        }
+      }
+
       if (container.contains(renderer.domElement)) {
         container.removeChild(renderer.domElement);
       }
     };
-  }, [resolvedPlyUrl, isDemoModel]);
+  }, [resolvedActiveUrl, isDemoModel]);
+
+  // Update object visibility when renderMode changes
+  useEffect(() => {
+    if (meshObjectRef.current) {
+      meshObjectRef.current.visible = renderMode === 'mesh';
+    }
+    if (wireframeObjectRef.current) {
+      wireframeObjectRef.current.visible = renderMode === 'wireframe';
+    }
+    if (pointsObjectRef.current) {
+      pointsObjectRef.current.visible = renderMode === 'points';
+    }
+  }, [renderMode]);
 
   // Toggle grid visibility
   useEffect(() => {
@@ -232,10 +315,10 @@ export const ThreeSurfaceViewer: React.FC<ThreeSurfaceViewerProps> = ({
 
   // Toggle measured deviation heatmap
   useEffect(() => {
-    const points = pointsObjectRef.current;
-    if (!points || !points.geometry) return;
+    const targetObj = meshObjectRef.current || pointsObjectRef.current;
+    if (!targetObj || !targetObj.geometry) return;
 
-    const geometry = points.geometry;
+    const geometry = targetObj.geometry;
     const pos = geometry.attributes.position;
     if (!pos) return;
 
@@ -246,7 +329,6 @@ export const ThreeSurfaceViewer: React.FC<ThreeSurfaceViewerProps> = ({
         geometry.attributes.intensity;
 
       if (deviationAttr) {
-        // True backend deviation scalar normalization
         const scalarAttr = deviationAttr as THREE.BufferAttribute;
         let minVal = Infinity;
         let maxVal = -Infinity;
@@ -260,7 +342,6 @@ export const ThreeSurfaceViewer: React.FC<ThreeSurfaceViewerProps> = ({
         for (let i = 0; i < pos.count; i++) {
           const val = scalarAttr.getX(i);
           const t = Math.min(1.0, Math.max(0.0, (val - minVal) / range));
-          // Pale sage to warm terracotta
           colors[i * 3] = 0.58 + t * 0.25;
           colors[i * 3 + 1] = 0.72 - t * 0.22;
           colors[i * 3 + 2] = 0.58 - t * 0.2;
@@ -268,7 +349,6 @@ export const ThreeSurfaceViewer: React.FC<ThreeSurfaceViewerProps> = ({
         geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
         geometry.attributes.color.needsUpdate = true;
       } else if (isSampleGeometry) {
-        // Explicitly labelled demo simulation only
         const colors = new Float32Array(pos.count * 3);
         for (let i = 0; i < pos.count; i++) {
           const z = pos.getZ(i);
@@ -292,7 +372,6 @@ export const ThreeSurfaceViewer: React.FC<ThreeSurfaceViewerProps> = ({
     const group = highlightGroupRef.current;
     if (!group) return;
 
-    // Clear previous highlights
     while (group.children.length > 0) {
       const child = group.children[0];
       group.remove(child);
@@ -311,7 +390,6 @@ export const ThreeSurfaceViewer: React.FC<ThreeSurfaceViewerProps> = ({
 
     const [fx, fy, fz] = finding.regionCenter3D;
 
-    // Create subtle circular highlight ring in warm terracotta
     const ringGeo = new THREE.RingGeometry(18, 22, 32);
     const ringMat = new THREE.MeshBasicMaterial({
       color: 0xc98f78,
@@ -323,7 +401,6 @@ export const ThreeSurfaceViewer: React.FC<ThreeSurfaceViewerProps> = ({
     ring.position.set(fx, fy, fz + 2);
     group.add(ring);
 
-    // Add subtle indicator post
     const lineGeo = new THREE.BufferGeometry().setFromPoints([
       new THREE.Vector3(fx, fy, fz),
       new THREE.Vector3(fx, fy, fz + 35),
@@ -340,8 +417,7 @@ export const ThreeSurfaceViewer: React.FC<ThreeSurfaceViewerProps> = ({
     controlsRef.current.update();
   };
 
-  // If no point cloud URL was provided for this inspection
-  if (!plyUrl) {
+  if (!activeUrl) {
     return (
       <div className="relative w-full h-[480px] md:h-[540px] rounded-xl overflow-hidden border border-[#E8E5DC] bg-[#F8F7F2] flex flex-col items-center justify-center p-6 text-center space-y-3 shadow-[0_1px_3px_rgba(0,0,0,0.02)]">
         <div className="w-10 h-10 rounded-full bg-[#F0EFE8] text-[#777D73] flex items-center justify-center">
@@ -350,7 +426,7 @@ export const ThreeSurfaceViewer: React.FC<ThreeSurfaceViewerProps> = ({
         <div className="space-y-1">
           <p className="text-sm font-semibold text-[#343832]">No 3D surface model available</p>
           <p className="text-xs text-[#777D73] max-w-sm leading-relaxed">
-            The processing pipeline has not produced a 3D PLY point cloud artifact for this inspection.
+            The processing pipeline has not produced a 3D PLY artifact for this inspection.
           </p>
         </div>
       </div>
@@ -358,6 +434,7 @@ export const ThreeSurfaceViewer: React.FC<ThreeSurfaceViewerProps> = ({
   }
 
   const canShowHeatmap = hasDeviationData || isSampleGeometry;
+  const hasMeshFaces = triangleCount !== null && triangleCount > 0;
 
   return (
     <div className="relative w-full h-[480px] md:h-[540px] rounded-xl overflow-hidden border border-[#E8E5DC] bg-[#F8F7F2] select-none shadow-[0_1px_3px_rgba(0,0,0,0.02)]">
@@ -388,13 +465,32 @@ export const ThreeSurfaceViewer: React.FC<ThreeSurfaceViewerProps> = ({
       {/* Top Left Geometry Info & Legend */}
       <div className="absolute top-4 left-4 z-10 flex flex-col gap-2">
         <div className="px-3 py-1.5 rounded-lg bg-white/90 backdrop-blur-md border border-[#E8E5DC] text-xs text-[#343832] shadow-xs flex items-center gap-2">
-          <span className="font-medium">3D Point Cloud</span>
-          <span className="text-[#9BA297]">•</span>
-          <span className="font-mono text-[#777D73] text-[11px]">
-            {pointCount !== null ? `${pointCount.toLocaleString()} points` : 'Loading'}
+          <span className="font-medium">
+            {renderMode === 'mesh'
+              ? 'Poisson Surface Mesh'
+              : renderMode === 'wireframe'
+              ? 'Wireframe Mesh'
+              : '3D Point Cloud'}
           </span>
           <span className="text-[#9BA297]">•</span>
-          {isSampleGeometry ? (
+          <span className="font-mono text-[#777D73] text-[11px]">
+            {renderMode === 'mesh' || renderMode === 'wireframe'
+              ? hasMeshFaces
+                ? `${triangleCount.toLocaleString()} triangles`
+                : `${pointCount?.toLocaleString()} points`
+              : pointCount !== null
+              ? `${pointCount.toLocaleString()} points`
+              : 'Loading'}
+          </span>
+          <span className="text-[#9BA297]">•</span>
+          {meshStatus === 'failed' ? (
+            <span
+              className="font-mono text-[10px] text-[#8F543E] bg-[#FBF0EC] px-1.5 py-0.5 rounded border border-[#EACEC5]"
+              title={meshError || 'Mesh generation failed; point cloud preserved'}
+            >
+              Mesh Unavailable
+            </span>
+          ) : isSampleGeometry ? (
             <span className="font-mono text-[10px] text-[#777D73] bg-[#F0EFE8] px-1.5 py-0.5 rounded border border-[#E8E5DC]">
               Sample Test Geometry
             </span>
@@ -422,6 +518,45 @@ export const ThreeSurfaceViewer: React.FC<ThreeSurfaceViewerProps> = ({
 
       {/* Top Right Controls Toolbar */}
       <div className="absolute top-4 right-4 z-10 flex items-center gap-1.5 bg-white/90 backdrop-blur-md border border-[#E8E5DC] p-1 rounded-lg shadow-xs">
+        {/* Render Mode Toggle (Surface Mesh / Points / Wireframe) */}
+        {hasMeshFaces && (
+          <div className="flex items-center p-0.5 rounded bg-[#F0EFE8] border border-[#E8E5DC] text-[11px] mr-1">
+            <button
+              type="button"
+              onClick={() => setRenderMode('mesh')}
+              className={`px-2 py-0.5 rounded font-medium transition-colors cursor-pointer ${
+                renderMode === 'mesh'
+                  ? 'bg-white text-[#343832] shadow-xs'
+                  : 'text-[#777D73] hover:text-[#343832]'
+              }`}
+            >
+              Surface
+            </button>
+            <button
+              type="button"
+              onClick={() => setRenderMode('points')}
+              className={`px-2 py-0.5 rounded font-medium transition-colors cursor-pointer ${
+                renderMode === 'points'
+                  ? 'bg-white text-[#343832] shadow-xs'
+                  : 'text-[#777D73] hover:text-[#343832]'
+              }`}
+            >
+              Points
+            </button>
+            <button
+              type="button"
+              onClick={() => setRenderMode('wireframe')}
+              className={`px-2 py-0.5 rounded font-medium transition-colors cursor-pointer ${
+                renderMode === 'wireframe'
+                  ? 'bg-white text-[#343832] shadow-xs'
+                  : 'text-[#777D73] hover:text-[#343832]'
+              }`}
+            >
+              Wireframe
+            </button>
+          </div>
+        )}
+
         {canShowHeatmap ? (
           <button
             type="button"
@@ -451,7 +586,7 @@ export const ThreeSurfaceViewer: React.FC<ThreeSurfaceViewerProps> = ({
           </button>
         ) : (
           <span
-            title="Deviation heatmap unavailable: backend point cloud does not contain deviation scalars"
+            title="Deviation heatmap unavailable: backend geometry does not contain deviation scalars"
             className="px-2.5 py-1 text-xs font-medium text-[#9BA297] bg-[#F0EFE8]/50 rounded cursor-not-allowed select-none"
           >
             Deviation unmeasured
