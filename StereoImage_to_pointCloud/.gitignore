@@ -1,0 +1,36 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local Python environments.
+.venv/
+venv/
+env/
+
+# Model weights are large and should be downloaded or managed with Git LFS.
+*.pth
+*.pt
+
+# External RAFT-Stereo clone and downloaded datasets.
+RAFT-Stereo/
+datasets/
+
+# Generated reconstructions and intermediate arrays.
+reconstruction/
+reconstruction-*/
+*.npy
+*.ply
+
+# User-provided calibration and input data may be private or dataset-licensed.
+calib.txt
+left.png
+right.png
+MyREADME.md
+
+# Local editor and operating-system files.
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

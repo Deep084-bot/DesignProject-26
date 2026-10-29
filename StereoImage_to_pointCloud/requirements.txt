@@ -1,0 +1,8 @@
+numpy
+Pillow
+open3d
+torch
+tqdm
+scipy
+opt_einsum
+opencv-python-headless
