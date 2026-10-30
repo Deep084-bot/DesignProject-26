@@ -187,7 +187,7 @@ def run_pipeline(
                 mesh_res = reconstruct_surface_mesh(
                     point_cloud_ply_path=ply_path,
                     output_mesh_ply_path=mesh_ply_path,
-                    depth=8,
+                    depth=None,
                     density_trim_percent=5.0,
                 )
                 if mesh_ply_path.exists() and mesh_ply_path.stat().st_size > 0:
