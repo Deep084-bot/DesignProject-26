@@ -1,9 +1,20 @@
 import React, { useState, useEffect } from 'react';
 import { useParams, Link } from 'react-router-dom';
-import { ArrowLeft, Box, Calendar, Server, PlayCircle, Download } from 'lucide-react';
+import {
+  ArrowLeft,
+  Box,
+  Calendar,
+  Server,
+  PlayCircle,
+  Download,
+  AlertTriangle,
+  Image as ImageIcon,
+  Activity,
+} from 'lucide-react';
 import { fetchInspectionById } from '../services/api';
 import type { Inspection } from '../types/inspection';
 import { ThreeSurfaceViewer } from '../components/viewer/ThreeSurfaceViewer';
+import { SurfaceImageOverlay } from '../components/viewer/SurfaceImageOverlay';
 import { StatusBadge, FindingBadge } from '../components/common/Badge';
 import { Button } from '../components/common/Button';
 
@@ -13,6 +24,8 @@ export const InspectionDetailPage: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [selectedFindingId, setSelectedFindingId] = useState<string | null>(null);
+  const [activeViewMode, setActiveViewMode] = useState<'3d' | '2d'>('3d');
+  const [cropLoadErrors, setCropLoadErrors] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
     if (!id) return;
@@ -62,6 +75,7 @@ export const InspectionDetailPage: React.FC = () => {
   const selectedFinding =
     inspection.findings.find((f) => f.id === selectedFindingId) || inspection.findings[0];
   const crackCount = inspection.findings.filter((f) => f.type === 'potential_crack').length;
+  const irregularityCount = inspection.findings.filter((f) => f.type === 'surface_irregularity').length;
 
   const formatDate = (isoString: string) => {
     try {
@@ -77,6 +91,11 @@ export const InspectionDetailPage: React.FC = () => {
       return isoString;
     }
   };
+
+  const hasClassifierIssue =
+    inspection.classifierStatus === 'unavailable' || inspection.classifierStatus === 'failed';
+
+  const rectifiedUrl = inspection.rectifiedLeftUrl || inspection.leftImage?.url;
 
   return (
     <div className="space-y-6">
@@ -132,19 +151,75 @@ export const InspectionDetailPage: React.FC = () => {
         </div>
       </div>
 
-      {/* Main 3D Viewer & Findings Grid */}
+      {/* Classifier Status Notice Banner (when unavailable or failed) */}
+      {hasClassifierIssue && (
+        <div className="p-4 rounded-xl bg-[#FBF0EC] border border-[#EACEC5] text-xs space-y-1">
+          <div className="flex items-center gap-2 text-[#8F543E] font-medium">
+            <AlertTriangle className="w-4 h-4 flex-shrink-0" />
+            <span>
+              Neural-network crack classifier {inspection.classifierStatus === 'unavailable' ? 'unavailable' : 'failed'}
+              {inspection.classifierError ? `: ${inspection.classifierError}` : ''}
+            </span>
+          </div>
+          <p className="text-[#8F543E]/90 pl-6 text-[11px] leading-relaxed">
+            Visual pattern crack classification was not evaluated for this inspection. Geometric 3D surface reconstruction and depth deviation measurements remain valid and are displayed below.
+          </p>
+        </div>
+      )}
+
+      {/* Main View Mode Selector Tabs */}
+      <div className="flex items-center gap-2 border-b border-[#E8E5DC] pb-3 text-xs">
+        <button
+          type="button"
+          onClick={() => setActiveViewMode('3d')}
+          className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-medium transition-colors ${
+            activeViewMode === '3d'
+              ? 'bg-[#E7EDE4] text-[#3F513D] border border-[#D5E0D1]'
+              : 'text-[#777D73] hover:text-[#343832] hover:bg-[#F0EFE8]'
+          }`}
+        >
+          <Box className="w-3.5 h-3.5" />
+          <span>3D Surface Model</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => setActiveViewMode('2d')}
+          className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-medium transition-colors ${
+            activeViewMode === '2d'
+              ? 'bg-[#E7EDE4] text-[#3F513D] border border-[#D5E0D1]'
+              : 'text-[#777D73] hover:text-[#343832] hover:bg-[#F0EFE8]'
+          }`}
+        >
+          <ImageIcon className="w-3.5 h-3.5" />
+          <span>2D Rectified View & Heatmap</span>
+        </button>
+      </div>
+
+      {/* Main Visualizer & Findings Grid */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-        {/* 3D Canvas (Spacious Left Column) */}
+        {/* Left Column (Primary Visual View) */}
         <div className="lg:col-span-8 space-y-4">
-          <ThreeSurfaceViewer
-            plyUrl={inspection.pointCloudUrl}
-            meshUrl={inspection.meshUrl}
-            meshStatus={inspection.meshStatus}
-            meshError={inspection.meshError}
-            findings={inspection.findings}
-            selectedFindingId={selectedFindingId}
-            isDemoModel={inspection.isDemoMode}
-          />
+          {activeViewMode === '3d' ? (
+            <ThreeSurfaceViewer
+              plyUrl={inspection.pointCloudUrl}
+              meshUrl={inspection.meshUrl}
+              meshStatus={inspection.meshStatus}
+              meshError={inspection.meshError}
+              findings={inspection.findings}
+              selectedFindingId={selectedFindingId}
+              isDemoModel={inspection.isDemoMode}
+            />
+          ) : (
+            <SurfaceImageOverlay
+              imageUrl={rectifiedUrl || ''}
+              heatmapUrl={inspection.deviationHeatmapUrl}
+              findings={inspection.findings}
+              selectedFindingId={selectedFindingId}
+              onSelectFinding={(fId) => setSelectedFindingId(fId)}
+              deviationSummary={inspection.deviationSummary}
+            />
+          )}
 
           {/* Artifact Download & Geometry Action Strip */}
           {(inspection.meshUrl || inspection.pointCloudUrl || inspection.meshStatus === 'failed') && (
@@ -208,16 +283,18 @@ export const InspectionDetailPage: React.FC = () => {
             </div>
 
             <div className="bg-white p-3.5 rounded-xl border border-[#E8E5DC] text-xs space-y-1">
-              <span className="text-[#777D73] block text-[11px]">Flagged regions</span>
+              <span className="text-[#777D73] block text-[11px]">Flagged findings</span>
               <span className="font-medium text-[#343832] block font-mono">
-                {inspection.findings.length} total ({crackCount} potential cracks)
+                {inspection.findings.length} total ({crackCount} potential, {irregularityCount} geometric)
               </span>
             </div>
 
             <div className="bg-white p-3.5 rounded-xl border border-[#E8E5DC] text-xs space-y-1">
               <span className="text-[#777D73] block text-[11px]">Processing duration</span>
               <span className="font-medium text-[#343832] block font-mono">
-                {inspection.processingDurationSec ? `${inspection.processingDurationSec}s` : 'Not recorded'}
+                {typeof inspection.processingDurationSec === 'number'
+                  ? `${inspection.processingDurationSec.toFixed(2)}s`
+                  : 'Not recorded'}
               </span>
             </div>
           </div>
@@ -234,7 +311,7 @@ export const InspectionDetailPage: React.FC = () => {
                 <p className="text-[11px] text-[#777D73] mt-0.5">
                   {inspection.isDemoMode
                     ? 'Simulated sample findings for interface testing.'
-                    : 'Verified processing output from backend pipeline.'}
+                    : 'Correlated visual and geometric findings.'}
                 </p>
               </div>
               <span className="text-xs font-mono font-medium text-[#777D73] bg-[#F8F7F2] px-2 py-0.5 rounded border border-[#E8E5DC]">
@@ -243,51 +320,69 @@ export const InspectionDetailPage: React.FC = () => {
             </div>
 
             {inspection.findings.length > 0 ? (
-              <div className="divide-y divide-[#E8E5DC] max-h-[460px] overflow-y-auto">
+              <div className="divide-y divide-[#E8E5DC] max-h-[520px] overflow-y-auto">
                 {inspection.findings.map((finding) => {
                   const isSelected = finding.id === selectedFindingId;
+                  const hasCropError = cropLoadErrors[finding.id];
+
                   return (
                     <div
                       key={finding.id}
                       onClick={() => setSelectedFindingId(finding.id)}
-                      className={`p-4 space-y-2 cursor-pointer transition-colors ${
-                        isSelected ? 'bg-[#F0EFE8]/70 border-l-2 border-l-[#9BAE98]' : 'hover:bg-[#F8F7F2]/60'
+                      className={`p-4 space-y-2.5 cursor-pointer transition-colors ${
+                        isSelected ? 'bg-[#F0EFE8]/70 border-l-2 border-l-[#5B7358]' : 'hover:bg-[#F8F7F2]/60'
                       }`}
                     >
                       <div className="flex items-center justify-between">
                         <div className="flex items-center gap-2">
-                          <span className="font-mono text-xs font-medium text-[#343832]">{finding.id}</span>
+                          <span className="font-mono text-xs font-semibold text-[#343832]">{finding.id}</span>
                           <FindingBadge type={finding.type} />
                         </div>
                         {isSelected && (
-                          <span className="text-[10px] text-[#5B7358] font-medium bg-[#E7EDE4] px-1.5 py-0.5 rounded">
+                          <span className="text-[10px] text-[#3F513D] font-medium bg-[#E7EDE4] px-1.5 py-0.5 rounded border border-[#D5E0D1]">
                             Active
                           </span>
                         )}
                       </div>
 
-                      <p className="text-xs text-[#777D73] leading-relaxed">
-                        {finding.description}
-                      </p>
+                      {/* Finding Card Body: Thumbnail & Details */}
+                      <div className="flex items-start gap-3">
+                        {finding.imageCropUrl && !hasCropError ? (
+                          <img
+                            src={finding.imageCropUrl}
+                            alt={`${finding.id} crop`}
+                            onError={() =>
+                              setCropLoadErrors((prev) => ({ ...prev, [finding.id]: true }))
+                            }
+                            className="w-14 h-14 rounded-lg object-cover border border-[#E8E5DC] flex-shrink-0 bg-[#F0EFE8]"
+                          />
+                        ) : (
+                          <div className="w-14 h-14 rounded-lg border border-[#E8E5DC] bg-[#F8F7F2] flex items-center justify-center text-[#9BA297] flex-shrink-0">
+                            <Activity className="w-5 h-5 text-[#9BA297]" />
+                          </div>
+                        )}
 
-                      {/* Explicit Image Prediction vs Physical Geometry */}
-                      <div className="pt-1 grid grid-cols-2 gap-2 text-[11px] border-t border-[#E8E5DC]/80">
+                        <p className="text-xs text-[#777D73] leading-relaxed flex-1">
+                          {finding.description}
+                        </p>
+                      </div>
+
+                      {/* Metric Strips: Confidence & Deviation */}
+                      <div className="pt-1.5 grid grid-cols-2 gap-2 text-[11px] border-t border-[#E8E5DC]/80">
                         <div>
                           <span className="text-[#9BA297] block text-[10px]">Visual confidence:</span>
                           <span className="font-mono text-[#343832] font-medium">
                             {typeof finding.confidence === 'number'
                               ? `${(finding.confidence * 100).toFixed(0)}%`
-                              : 'Not evaluated'}
+                              : 'n/a'}
                           </span>
                         </div>
                         <div>
                           <span className="text-[#9BA297] block text-[10px]">Geometric deviation:</span>
                           <span className="font-mono text-[#8F543E] font-medium">
                             {typeof finding.geometricDeviationMm === 'number'
-                              ? `${finding.geometricDeviationMm} mm indentation`
-                              : finding.deviationUnit === 'relative'
-                              ? 'Relative scale'
-                              : 'Unmeasured'}
+                              ? `${finding.geometricDeviationMm} mm`
+                              : 'n/a'}
                           </span>
                         </div>
                       </div>
@@ -312,6 +407,7 @@ export const InspectionDetailPage: React.FC = () => {
                 <h3 className="text-xs font-semibold text-[#343832] uppercase tracking-wider">
                   Detailed observation • {selectedFinding.id}
                 </h3>
+                <FindingBadge type={selectedFinding.type} />
               </div>
 
               <div className="p-3 rounded-lg bg-[#F8F7F2] border border-[#E8E5DC] text-xs space-y-2">
@@ -323,11 +419,7 @@ export const InspectionDetailPage: React.FC = () => {
                 </div>
 
                 <div className="pt-2 border-t border-[#E8E5DC] text-[11px] text-[#777D73] leading-relaxed">
-                  <strong className="text-[#343832]">Scientific note:</strong> Visual classifier confidence reflects image pattern correlation, whereas physical depth displacement{' '}
-                  {typeof selectedFinding.geometricDeviationMm === 'number'
-                    ? `(${selectedFinding.geometricDeviationMm} mm)`
-                    : '(unmeasured)'}{' '}
-                  represents verified 3D point cloud surface indentation.
+                  <strong className="text-[#343832]">Engineering note:</strong> Potential crack classifications indicate high visual classifier probability ({typeof selectedFinding.confidence === 'number' ? `${(selectedFinding.confidence * 100).toFixed(0)}%` : 'n/a'}), whereas measured geometric deviation ({typeof selectedFinding.geometricDeviationMm === 'number' ? `${selectedFinding.geometricDeviationMm} mm` : 'n/a'}) reflects physical surface indentation.
                 </div>
               </div>
             </div>

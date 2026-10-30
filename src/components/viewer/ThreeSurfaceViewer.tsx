@@ -55,6 +55,7 @@ export const ThreeSurfaceViewer: React.FC<ThreeSurfaceViewerProps> = ({
   const originalColorsRef = useRef<THREE.BufferAttribute | null>(null);
   const highlightGroupRef = useRef<THREE.Group | null>(null);
   const initialCameraPosRef = useRef<THREE.Vector3>(new THREE.Vector3(0, 0, 800));
+  const geometryCenterOffsetRef = useRef<THREE.Vector3>(new THREE.Vector3(0, 0, 0));
 
   // Resolved URL pointing to backend or local sample
   const resolvedActiveUrl = resolveArtifactUrl(activeUrl);
@@ -138,6 +139,10 @@ export const ThreeSurfaceViewer: React.FC<ThreeSurfaceViewerProps> = ({
 
         const box = geometry.boundingBox || new THREE.Box3();
         const size = box.getSize(new THREE.Vector3());
+
+        const center = new THREE.Vector3();
+        box.getCenter(center);
+        geometryCenterOffsetRef.current.copy(center);
 
         // Center display coordinates
         geometry.center();
@@ -367,7 +372,7 @@ export const ThreeSurfaceViewer: React.FC<ThreeSurfaceViewerProps> = ({
     }
   }, [showHeatmap, isSampleGeometry]);
 
-  // Render 3D highlight markers when finding is selected
+  // Render 3D markers for all findings and highlight selected finding
   useEffect(() => {
     const group = highlightGroupRef.current;
     if (!group) return;
@@ -383,31 +388,62 @@ export const ThreeSurfaceViewer: React.FC<ThreeSurfaceViewerProps> = ({
       }
     }
 
-    if (!selectedFindingId) return;
+    const offset = geometryCenterOffsetRef.current;
 
-    const finding = findings.find((f) => f.id === selectedFindingId);
-    if (!finding || !finding.regionCenter3D) return;
+    findings.forEach((finding) => {
+      if (!finding.regionCenter3D || !Array.isArray(finding.regionCenter3D) || finding.regionCenter3D.length < 3) {
+        return;
+      }
+      const [rawX, rawY, rawZ] = finding.regionCenter3D;
+      if (!Number.isFinite(rawX) || !Number.isFinite(rawY) || !Number.isFinite(rawZ)) {
+        return;
+      }
 
-    const [fx, fy, fz] = finding.regionCenter3D;
+      const isSelected = finding.id === selectedFindingId;
+      const markerPos = new THREE.Vector3(rawX - offset.x, rawY - offset.y, rawZ - offset.z);
 
-    const ringGeo = new THREE.RingGeometry(18, 22, 32);
-    const ringMat = new THREE.MeshBasicMaterial({
-      color: 0xc98f78,
-      side: THREE.DoubleSide,
-      transparent: true,
-      opacity: 0.85,
+      const colorHex =
+        finding.type === 'potential_crack'
+          ? 0xc94a29
+          : finding.type === 'surface_irregularity'
+          ? 0x2b6cb0
+          : 0x7c3aed;
+
+      // Small sphere marker at center
+      const sphereGeo = new THREE.SphereGeometry(isSelected ? 6 : 4, 16, 16);
+      const sphereMat = new THREE.MeshBasicMaterial({ color: colorHex });
+      const sphere = new THREE.Mesh(sphereGeo, sphereMat);
+      sphere.position.copy(markerPos);
+      group.add(sphere);
+
+      // Selected finding gets prominent ring and vertical indicator pin
+      if (isSelected) {
+        const ringGeo = new THREE.RingGeometry(14, 18, 32);
+        const ringMat = new THREE.MeshBasicMaterial({
+          color: colorHex,
+          side: THREE.DoubleSide,
+          transparent: true,
+          opacity: 0.9,
+        });
+        const ring = new THREE.Mesh(ringGeo, ringMat);
+        ring.position.set(markerPos.x, markerPos.y, markerPos.z + 2);
+        group.add(ring);
+
+        const lineGeo = new THREE.BufferGeometry().setFromPoints([
+          markerPos,
+          new THREE.Vector3(markerPos.x, markerPos.y, markerPos.z + 30),
+        ]);
+        const lineMat = new THREE.LineBasicMaterial({ color: colorHex });
+        const line = new THREE.Line(lineGeo, lineMat);
+        group.add(line);
+
+        // Smoothly focus OrbitControls target on selected finding
+        if (controlsRef.current) {
+          controlsRef.current.target.set(markerPos.x, markerPos.y, markerPos.z);
+          controlsRef.current.update();
+        }
+      }
     });
-    const ring = new THREE.Mesh(ringGeo, ringMat);
-    ring.position.set(fx, fy, fz + 2);
-    group.add(ring);
-
-    const lineGeo = new THREE.BufferGeometry().setFromPoints([
-      new THREE.Vector3(fx, fy, fz),
-      new THREE.Vector3(fx, fy, fz + 35),
-    ]);
-    const lineMat = new THREE.LineBasicMaterial({ color: 0xc98f78 });
-    const line = new THREE.Line(lineGeo, lineMat);
-    group.add(line);
   }, [selectedFindingId, findings]);
 
   const resetCamera = () => {

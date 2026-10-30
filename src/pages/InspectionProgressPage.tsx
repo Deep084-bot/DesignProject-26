@@ -285,15 +285,30 @@ export const InspectionProgressPage: React.FC = () => {
                     >
                       {step.label}
                     </span>
-                    <span className="text-[11px] font-mono text-[#777D73]">
-                      {isStepCompleted
-                        ? 'Done'
-                        : isStepActive
-                        ? 'In progress'
-                        : isStepFailed
-                        ? 'Failed'
-                        : 'Waiting'}
-                    </span>
+                    <div className="flex items-center gap-2">
+                      {typeof step.durationSec === 'number' && (
+                        <span className="text-[10px] font-mono text-[#777D73] bg-[#F0EFE8] px-1.5 py-0.5 rounded">
+                          {step.durationSec.toFixed(2)}s
+                        </span>
+                      )}
+                      {step.worker && (
+                        <span
+                          className="text-[10px] font-mono text-[#3F513D] bg-[#E7EDE4] px-1.5 py-0.5 rounded border border-[#D5E0D1]"
+                          title={`Execution node: ${step.worker}`}
+                        >
+                          {step.worker}
+                        </span>
+                      )}
+                      <span className="text-[11px] font-mono text-[#777D73]">
+                        {isStepCompleted
+                          ? 'Done'
+                          : isStepActive
+                          ? 'In progress'
+                          : isStepFailed
+                          ? 'Failed'
+                          : 'Waiting'}
+                      </span>
+                    </div>
                   </div>
                   <p className="text-xs text-[#777D73] leading-relaxed">{step.description}</p>
                 </div>
