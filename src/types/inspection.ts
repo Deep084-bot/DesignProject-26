@@ -66,6 +66,10 @@ export interface Inspection {
   processingDurationSec?: number;
   pointCloudUrl?: string;
   pointCount?: number;
+  meshUrl?: string;
+  triangleCount?: number;
+  meshStatus?: 'completed' | 'failed' | 'unavailable';
+  meshError?: string;
   findings: Finding[];
   isDemoMode: boolean; // Transparent disclosure when offline or displaying sample inspections
   failureMessage?: string;

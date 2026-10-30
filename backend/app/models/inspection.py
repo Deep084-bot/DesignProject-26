@@ -94,6 +94,10 @@ class InspectionResponse(BaseModel):
     processing_duration_sec: Optional[float] = None
     point_cloud_url: Optional[str] = None
     point_count: Optional[int] = None
+    mesh_url: Optional[str] = None
+    triangle_count: Optional[int] = None
+    mesh_status: Optional[str] = None
+    mesh_error: Optional[str] = None
     findings: List[Finding] = Field(default_factory=list)
     failure_message: Optional[str] = None
     is_demo_mode: bool = False

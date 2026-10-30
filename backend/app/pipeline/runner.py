@@ -23,6 +23,7 @@ from .rectification import prepare_and_rectify
 from .stereo import compute_stereo_sgbm
 from .depth import reconstruct_3d_points
 from .ply_writer import write_ply
+from .mesh_reconstruction import reconstruct_surface_mesh
 from ..models.calibration import StereoCalibration
 
 
@@ -35,6 +36,10 @@ class PipelineExecutionResult:
         success: bool,
         point_count: int = 0,
         point_cloud_path: Optional[Path] = None,
+        mesh_path: Optional[Path] = None,
+        triangle_count: Optional[int] = None,
+        mesh_status: Optional[str] = None,
+        mesh_error: Optional[str] = None,
         disparity_path: Optional[Path] = None,
         disparity_vis_path: Optional[Path] = None,
         rectified_left_path: Optional[Path] = None,
@@ -46,6 +51,10 @@ class PipelineExecutionResult:
         self.success = success
         self.point_count = point_count
         self.point_cloud_path = point_cloud_path
+        self.mesh_path = mesh_path
+        self.triangle_count = triangle_count
+        self.mesh_status = mesh_status
+        self.mesh_error = mesh_error
         self.disparity_path = disparity_path
         self.disparity_vis_path = disparity_vis_path
         self.rectified_left_path = rectified_left_path
@@ -166,6 +175,37 @@ def run_pipeline(
         ply_path = job_dir / "pointcloud.ply"
         write_ply(ply_path, pt_cloud.points, pt_cloud.colors, binary=True)
 
+        # Run Poisson Surface Reconstruction (from PointCloudToMesh)
+        mesh_path: Optional[Path] = None
+        triangle_count: Optional[int] = None
+        mesh_status: str = "unavailable"
+        mesh_error: Optional[str] = None
+
+        if pt_cloud.valid_count >= 10:
+            mesh_ply_path = job_dir / "mesh.ply"
+            try:
+                mesh_res = reconstruct_surface_mesh(
+                    point_cloud_ply_path=ply_path,
+                    output_mesh_ply_path=mesh_ply_path,
+                    depth=8,
+                    density_trim_percent=5.0,
+                )
+                if mesh_ply_path.exists() and mesh_ply_path.stat().st_size > 0:
+                    mesh_path = mesh_ply_path
+                    triangle_count = mesh_res.get("num_triangles")
+                    mesh_status = "completed"
+                else:
+                    mesh_status = "failed"
+                    mesh_error = "Poisson reconstruction produced an empty mesh."
+            except Exception as mesh_err:
+                import logging
+                logging.getLogger(__name__).warning(f"Surface mesh reconstruction failed: {mesh_err}")
+                mesh_status = "failed"
+                mesh_error = str(mesh_err)
+        else:
+            mesh_status = "unavailable"
+            mesh_error = f"Point cloud contains only {pt_cloud.valid_count} points (minimum 10 required for mesh reconstruction)."
+
         report(2, "surface", "completed")
     except Exception as e:
         err_msg = str(e)
@@ -202,6 +242,10 @@ def run_pipeline(
         success=True,
         point_count=pt_cloud.valid_count,
         point_cloud_path=ply_path,
+        mesh_path=mesh_path,
+        triangle_count=triangle_count,
+        mesh_status=mesh_status,
+        mesh_error=mesh_error,
         disparity_path=disp_npy_path,
         disparity_vis_path=disp_vis_path,
         rectified_left_path=rect_left_path,
