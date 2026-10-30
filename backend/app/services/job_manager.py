@@ -196,8 +196,16 @@ class JobManager:
                 else:
                     job.mesh_url = None
                     job.triangle_count = None
+
+                if result.deviation_heatmap_path and result.deviation_heatmap_path.exists():
+                    job.deviation_heatmap_url = f"/api/inspections/{inspection_id}/artifacts/deviation_heatmap.png"
+                else:
+                    job.deviation_heatmap_url = None
+
+                job.deviation_summary = result.deviation_summary
+
                 job.failure_message = None
-                # Milestone 1: findings list remains empty [] (no fabricated defects)
+                # Milestone baseline: findings list remains empty [] (zero fabricated findings)
                 job.findings = []
                 for s in job.steps:
                     s.status = "completed"

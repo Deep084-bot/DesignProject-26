@@ -17,8 +17,11 @@ from __future__ import annotations
 import sys
 import time
 import tempfile
+import json
+import shutil
 from pathlib import Path
 from typing import Optional, Dict
+import numpy as np
 
 # Ensure backend package is in python search path
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -112,6 +115,36 @@ def main() -> int:
         if result.point_cloud_path and result.point_cloud_path.exists():
             point_cloud_exists = True
 
+        dev_map_path = job_dir / "deviation_map.npy"
+        dev_heatmap_path = job_dir / "deviation_heatmap.png"
+        dev_json_path = job_dir / "deviations.json"
+
+        dev_map_ok = False
+        dev_map_shape = None
+        dev_map_dtype = None
+        if dev_map_path.exists():
+            dev_map_arr = np.load(str(dev_map_path))
+            dev_map_ok = True
+            dev_map_shape = dev_map_arr.shape
+            dev_map_dtype = str(dev_map_arr.dtype)
+
+        dev_heatmap_ok = False
+        dev_heatmap_size_kb = 0.0
+        if dev_heatmap_path.exists():
+            dev_heatmap_ok = True
+            dev_heatmap_size_kb = dev_heatmap_path.stat().st_size / 1024.0
+            # Save a persistent copy of the sample heatmap for inspection
+            shutil.copy(str(dev_heatmap_path), str(REPO_ROOT / "deviation_heatmap.png"))
+
+        dev_json_ok = False
+        if dev_json_path.exists():
+            try:
+                with open(dev_json_path, "r", encoding="utf-8") as f:
+                    dev_data = json.load(f)
+                dev_json_ok = "summary" in dev_data and "regions" in dev_data
+            except Exception:
+                dev_json_ok = False
+
     print("------------------------------------------------------------")
     print("Benchmark Results:")
     print(f"  Overall Status:        {'SUCCESS' if result.success else 'FAILED'}")
@@ -135,6 +168,22 @@ def main() -> int:
         dur = stage_durations.get(stage_id)
         dur_str = f"{dur:.2f}s" if dur is not None else "not executed"
         print(f"  - {stage_id:<12}: {dur_str}")
+    print("------------------------------------------------------------")
+    print("Deviation Analysis (Stage 3):")
+    dev_sum = result.deviation_summary or {}
+    print(f"  Deviation Map:         {'EXISTS' if dev_map_ok else 'MISSING'} ({dev_map_shape}, {dev_map_dtype})")
+    print(f"  Deviation Heatmap:     {'EXISTS' if dev_heatmap_ok else 'MISSING'} ({dev_heatmap_size_kb:.1f} KB)")
+    print(f"  Deviations JSON:       {'EXISTS' if dev_json_ok else 'MISSING'}")
+    print(f"  Regions Detected:      {len(result.deviation_regions)}")
+    print(f"  RMSE:                  {dev_sum.get('rmse_mm', 'N/A')} mm")
+    print(f"  Sigma (MAD*1.4826):    {dev_sum.get('sigma_mm', 'N/A')} mm")
+    print(f"  Threshold (max 3s,5):  {dev_sum.get('threshold_mm', 'N/A')} mm")
+    print(f"  Max Depression:        {dev_sum.get('max_depression_mm', 'N/A')} mm")
+    print(f"  Max Bulge:             {dev_sum.get('max_bulge_mm', 'N/A')} mm")
+    print(f"  Inlier Fraction:       {dev_sum.get('inlier_fraction', 'N/A')}")
+    print(f"  Valid Pixel Fraction:  {dev_sum.get('valid_pixel_fraction', 'N/A')}")
+    print(f"  Plane Normal:          {dev_sum.get('plane_normal', 'N/A')}")
+    print(f"  Plane Offset:          {dev_sum.get('plane_offset_mm', 'N/A')} mm")
     print("============================================================")
 
     if not result.success:
