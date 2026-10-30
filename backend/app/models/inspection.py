@@ -100,6 +100,8 @@ class InspectionResponse(BaseModel):
     mesh_error: Optional[str] = None
     deviation_summary: Optional[Dict[str, Any]] = None
     deviation_heatmap_url: Optional[str] = None
+    classifier_status: Optional[str] = None
+    classifier_error: Optional[str] = None
     findings: List[Finding] = Field(default_factory=list)
     failure_message: Optional[str] = None
     is_demo_mode: bool = False

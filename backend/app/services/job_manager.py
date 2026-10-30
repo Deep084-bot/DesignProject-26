@@ -205,8 +205,15 @@ class JobManager:
                 job.deviation_summary = result.deviation_summary
 
                 job.failure_message = None
-                # Milestone baseline: findings list remains empty [] (zero fabricated findings)
-                job.findings = []
+                job.findings = result.findings or []
+                job.classifier_status = result.classifier_status
+                job.classifier_error = result.classifier_error
+                for f in job.findings:
+                    if f.image_crop_url and "/api/inspections/" in f.image_crop_url:
+                        parts = f.image_crop_url.split("/")
+                        if len(parts) >= 5 and parts[2] == "inspections":
+                            parts[3] = inspection_id
+                            f.image_crop_url = "/".join(parts)
                 for s in job.steps:
                     s.status = "completed"
             else:

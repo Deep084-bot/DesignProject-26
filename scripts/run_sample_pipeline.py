@@ -145,6 +145,14 @@ def main() -> int:
             except Exception:
                 dev_json_ok = False
 
+        crop_count = 0
+        findings = result.findings or []
+        for f in findings:
+            if f.image_crop_url:
+                crop_filename = f.image_crop_url.split("/")[-1]
+                if (job_dir / crop_filename).exists():
+                    crop_count += 1
+
     print("------------------------------------------------------------")
     print("Benchmark Results:")
     print(f"  Overall Status:        {'SUCCESS' if result.success else 'FAILED'}")
@@ -184,6 +192,20 @@ def main() -> int:
     print(f"  Valid Pixel Fraction:  {dev_sum.get('valid_pixel_fraction', 'N/A')}")
     print(f"  Plane Normal:          {dev_sum.get('plane_normal', 'N/A')}")
     print(f"  Plane Offset:          {dev_sum.get('plane_offset_mm', 'N/A')} mm")
+    print("------------------------------------------------------------")
+    print("Damage Findings (Stage 4):")
+    print(f"  Classifier Status:     {result.classifier_status}")
+    if result.classifier_error:
+        print(f"  Classifier Error:      {result.classifier_error}")
+    findings = result.findings or []
+    print(f"  Total Findings:        {len(findings)}")
+    type_counts = {}
+    for f in findings:
+        t = getattr(f, "type", "unknown")
+        type_counts[t] = type_counts.get(t, 0) + 1
+    for ftype, cnt in sorted(type_counts.items()):
+        print(f"    - {ftype:<20}: {cnt}")
+    print(f"  Crop Images Saved:     {crop_count}/{len(findings)}")
     print("============================================================")
 
     if not result.success:

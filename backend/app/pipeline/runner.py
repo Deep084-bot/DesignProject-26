@@ -13,7 +13,7 @@ Reports authentic progress and explicit errors without simulated timers.
 """
 
 from pathlib import Path
-from typing import Callable, Optional, Dict, Any
+from typing import Callable, Optional, Dict, Any, List
 import os
 import time
 import json
@@ -27,7 +27,9 @@ from .depth import reconstruct_3d_points
 from .ply_writer import write_ply
 from .mesh_reconstruction import reconstruct_surface_mesh
 from .deviations import analyze_deviations, compute_surface_deviations, DeviationRegion
+from .damage import detect_damage
 from ..models.calibration import StereoCalibration
+from ..models.inspection import Finding
 
 
 ProgressCallback = Callable[[int, str, str, Optional[str]], None]
@@ -51,6 +53,9 @@ class PipelineExecutionResult:
         deviation_heatmap_path: Optional[Path] = None,
         deviation_regions: Optional[list] = None,
         deviation_summary: Optional[Dict[str, Any]] = None,
+        findings: Optional[List[Finding]] = None,
+        classifier_status: Optional[str] = None,
+        classifier_error: Optional[str] = None,
         duration_sec: float = 0.0,
         failure_message: Optional[str] = None,
         failed_stage_index: Optional[int] = None,
@@ -72,6 +77,9 @@ class PipelineExecutionResult:
         self.deviation_regions = deviation_regions or []
         self.deviation_summary = deviation_summary if deviation_summary is not None else deviation_stats
         self.deviation_stats = self.deviation_summary
+        self.findings = findings or []
+        self.classifier_status = classifier_status
+        self.classifier_error = classifier_error
         self.duration_sec = duration_sec
         self.failure_message = failure_message
         self.failed_stage_index = failed_stage_index
@@ -286,11 +294,47 @@ def run_pipeline(
         )
 
     # ---------------------------------------------------------
-    # Stage 4: damage (Step 2 not yet implemented; zero fabricated findings)
+    # Stage 4: damage (Visual crack classification & finding correlation)
     # ---------------------------------------------------------
     report(4, "damage", "active")
-    # Honest baseline execution: crack classifier unconfigured, no fake anomalies
-    report(4, "damage", "completed")
+    findings: List[Finding] = []
+    classifier_status: Optional[str] = None
+    classifier_error: Optional[str] = None
+
+    tile_size = int(os.environ.get("SURFACE_TILE_SIZE", "256"))
+    crack_threshold = float(os.environ.get("SURFACE_CRACK_THRESHOLD", "0.5"))
+
+    intrinsics = {
+        "fx": rect_params.fx,
+        "fy": rect_params.fy,
+        "cx": rect_params.cx,
+        "cy": rect_params.cy,
+        "baseline_mm": rect_params.baseline_mm,
+    }
+
+    try:
+        damage_res = detect_damage(
+            rectified_left_bgr=rect_params.rectified_left,
+            deviation_regions=deviation_regions,
+            disparity=disparity_float,
+            intrinsics=intrinsics,
+            tile=tile_size,
+            threshold=crack_threshold,
+            job_dir=job_dir,
+        )
+        findings = damage_res.findings
+        classifier_status = damage_res.classifier_status
+        classifier_error = damage_res.classifier_error
+        report(4, "damage", "completed")
+    except Exception as e:
+        err_msg = str(e)
+        report(4, "damage", "failed", err_msg)
+        return PipelineExecutionResult(
+            success=False,
+            duration_sec=round(time.perf_counter() - start_time, 2),
+            failure_message=err_msg,
+            failed_stage_index=4,
+        )
 
     # ---------------------------------------------------------
     # Stage 5: results (Wrap-up)
@@ -315,5 +359,8 @@ def run_pipeline(
         deviation_heatmap_path=deviation_heatmap_path,
         deviation_regions=deviation_regions,
         deviation_summary=deviation_summary,
+        findings=findings,
+        classifier_status=classifier_status,
+        classifier_error=classifier_error,
         duration_sec=duration,
     )
