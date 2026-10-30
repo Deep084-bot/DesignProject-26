@@ -103,3 +103,26 @@ export interface NewInspectionInput {
   rightImageFile: File | null;
   calibrationFile: File | null;
 }
+
+export interface ClusterWorker {
+  name: string;
+  online: boolean;
+  activeJobs: string[];
+  tasksDone: number;
+}
+
+export interface ClusterWorkersResponse {
+  mode: 'local' | 'celery';
+  workers: ClusterWorker[];
+}
+
+export interface ClusterSummaryResponse {
+  mode: 'local' | 'celery';
+  totalJobs: number;
+  queued: number;
+  processing: number;
+  completed: number;
+  failed: number;
+  activeAssignments: Record<string, string>;
+}
+

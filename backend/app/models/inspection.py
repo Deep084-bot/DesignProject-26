@@ -54,6 +54,8 @@ class PipelineStep(BaseModel):
     label: str
     description: str
     status: PipelineStatus = "waiting"
+    worker: Optional[str] = None
+    duration_sec: Optional[float] = None
 
 
 class ImageFileMeta(BaseModel):

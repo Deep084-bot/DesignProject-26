@@ -1,30 +1,31 @@
 """
 Job Manager and Background Execution Service for Surface.
 
+Authoritative specification: SURFACE_Master_Prompt.md Section 4.1 & 4.2.
 Manages inspection job lifecycles:
 - Isolated filesystem workspace per job (backend/storage/jobs/{inspection_id})
-- Safe file naming (avoids arbitrary user paths)
-- Asynchronous pipeline execution using Python ThreadPoolExecutor
+- Safe file naming and artifact containment
 - Thread-safe inspection state tracking and persistent JSON synchronization
-- Clean modular design ready for eventual migration to Celery/Redis
+- Unified state updates via apply_step_update, apply_result, apply_failure
+  for both local thread-pool execution and distributed Celery workers
 """
 
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 import json
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
-import shutil
 
 from ..models.inspection import (
     InspectionResponse,
     ImageFileMeta,
     CalibrationSummary,
-    DEFAULT_STAGES,
-    PipelineStep,
+    Finding,
 )
 from ..models.calibration import StereoCalibration
 from ..pipeline.runner import run_pipeline, PipelineExecutionResult
+from .. import settings
 
 
 # Base storage directory
@@ -64,6 +65,152 @@ class JobManager:
         with open(meta_file, "w", encoding="utf-8") as f:
             json.dump(inspection.model_dump(), f, indent=2)
 
+    def apply_step_update(
+        self,
+        inspection_id: str,
+        index: int,
+        step_id: str,
+        status: str,
+        worker: Optional[str] = None,
+        duration_sec: Optional[float] = None,
+        message: Optional[str] = None,
+    ) -> bool:
+        """
+        Thread-safe application of a stage progress update.
+        Ignores late updates if job is already in a terminal state (completed or failed).
+        Returns True if updated, False if job not found or update ignored.
+        """
+        with self._lock:
+            if inspection_id not in self._jobs:
+                return False
+            job = self._jobs[inspection_id]
+            if job.status in ("completed", "failed"):
+                return False
+
+            if job.status == "queued" and status in ("active", "processing"):
+                job.status = "processing"
+
+            job.current_step_index = index
+            if 0 <= index < len(job.steps):
+                step = job.steps[index]
+                step.status = status  # type: ignore
+                if worker is not None:
+                    step.worker = worker
+                if duration_sec is not None:
+                    step.duration_sec = duration_sec
+
+            if status == "failed" and message:
+                job.failure_message = message
+
+            self._save_job_state(job)
+            return True
+
+    def apply_result(
+        self,
+        inspection_id: str,
+        point_count: int,
+        mesh_status: str,
+        mesh_error: Optional[str] = None,
+        triangle_count: Optional[int] = None,
+        deviation_summary: Optional[Dict[str, Any]] = None,
+        findings: Optional[List[Any]] = None,
+        classifier_status: Optional[str] = None,
+        classifier_error: Optional[str] = None,
+        duration_sec: float = 0.0,
+        worker: Optional[str] = None,
+    ) -> bool:
+        """
+        Thread-safe application of successful inspection results.
+        Ignores duplicate completion if job is already in a terminal state.
+        Returns True if applied, False if job not found or ignored.
+        """
+        with self._lock:
+            if inspection_id not in self._jobs:
+                return False
+            job = self._jobs[inspection_id]
+            if job.status in ("completed", "failed"):
+                return False
+
+            job.status = "completed"
+            job.current_step_index = len(job.steps) - 1
+            job.processing_duration_sec = duration_sec
+            job.point_count = point_count
+            job.point_cloud_url = f"/api/inspections/{inspection_id}/artifacts/pointcloud.ply"
+            job.mesh_status = mesh_status  # type: ignore
+            job.mesh_error = mesh_error
+
+            job_dir = self.storage_dir / inspection_id
+            if (job_dir / "mesh.ply").exists() or (mesh_status == "completed" and triangle_count):
+                job.mesh_url = f"/api/inspections/{inspection_id}/artifacts/mesh.ply"
+                job.triangle_count = triangle_count
+            else:
+                job.mesh_url = None
+                job.triangle_count = None
+
+            if (job_dir / "deviation_heatmap.png").exists() or (deviation_summary is not None):
+                job.deviation_heatmap_url = f"/api/inspections/{inspection_id}/artifacts/deviation_heatmap.png"
+            else:
+                job.deviation_heatmap_url = None
+
+            job.deviation_summary = deviation_summary
+            job.failure_message = None
+
+            # Process findings, converting any dict inputs to Finding models
+            parsed_findings: List[Finding] = []
+            for item in findings or []:
+                if isinstance(item, dict):
+                    finding_obj = Finding(**item)
+                else:
+                    finding_obj = item
+                # Normalize crop URL inspection ID
+                if finding_obj.image_crop_url and "/api/inspections/" in finding_obj.image_crop_url:
+                    parts = finding_obj.image_crop_url.split("/")
+                    if len(parts) >= 5 and parts[2] == "inspections":
+                        parts[3] = inspection_id
+                        finding_obj.image_crop_url = "/".join(parts)
+                parsed_findings.append(finding_obj)
+
+            job.findings = parsed_findings
+            job.classifier_status = classifier_status  # type: ignore
+            job.classifier_error = classifier_error
+
+            for s in job.steps:
+                s.status = "completed"
+                if worker and not s.worker:
+                    s.worker = worker
+
+            self._save_job_state(job)
+            return True
+
+    def apply_failure(
+        self,
+        inspection_id: str,
+        message: str,
+        failed_stage_index: Optional[int] = None,
+        worker: Optional[str] = None,
+    ) -> bool:
+        """
+        Thread-safe application of a job failure.
+        Ignores failure update if job is already in a terminal state.
+        Returns True if applied, False if job not found or ignored.
+        """
+        with self._lock:
+            if inspection_id not in self._jobs:
+                return False
+            job = self._jobs[inspection_id]
+            if job.status in ("completed", "failed"):
+                return False
+
+            job.status = "failed"
+            job.failure_message = message
+            if failed_stage_index is not None and 0 <= failed_stage_index < len(job.steps):
+                job.steps[failed_stage_index].status = "failed"
+                if worker:
+                    job.steps[failed_stage_index].worker = worker
+
+            self._save_job_state(job)
+            return True
+
     def create_job(
         self,
         inspection_id: str,
@@ -77,9 +224,11 @@ class JobManager:
         calibration: StereoCalibration,
         calibration_summary: Optional[CalibrationSummary],
         raw_calibration_bytes: Optional[bytes] = None,
+        dispatch_mode: Optional[str] = None,
     ) -> InspectionResponse:
         """
-        Initializes a job directory, writes sanitized input files, and schedules background processing.
+        Initializes a job directory, writes sanitized input files, records job state,
+        and optionally schedules local background processing depending on execution mode.
         """
         job_dir = self.storage_dir / inspection_id
         job_dir.mkdir(parents=True, exist_ok=True)
@@ -129,15 +278,17 @@ class JobManager:
             self._jobs[inspection_id] = inspection
             self._save_job_state(inspection)
 
-        # Dispatch background worker
-        self.executor.submit(
-            self._execute_pipeline_task,
-            inspection_id,
-            job_dir,
-            left_path,
-            right_path,
-            calibration,
-        )
+        # Determine execution dispatch
+        mode = dispatch_mode or settings.get_execution_mode()
+        if mode == "local":
+            self.executor.submit(
+                self._execute_pipeline_task,
+                inspection_id,
+                job_dir,
+                left_path,
+                right_path,
+                calibration,
+            )
 
         return inspection
 
@@ -149,80 +300,72 @@ class JobManager:
         right_path: Path,
         calibration: StereoCalibration,
     ):
-        """Worker function executing the stereo pipeline."""
+        """Worker function executing the stereo pipeline in local thread-pool mode."""
+        worker_name = settings.get_worker_name()
+
         with self._lock:
             if inspection_id not in self._jobs:
                 return
             self._jobs[inspection_id].status = "processing"
             self._save_job_state(self._jobs[inspection_id])
 
+        stage_start_times: Dict[int, float] = {}
+
         def on_step_change(step_idx: int, stage_id: str, status: str, msg: Optional[str] = None):
-            with self._lock:
-                if inspection_id not in self._jobs:
-                    return
-                job = self._jobs[inspection_id]
-                job.current_step_index = step_idx
-                if step_idx < len(job.steps):
-                    job.steps[step_idx].status = status  # type: ignore
-                if status == "failed" and msg:
-                    job.failure_message = msg
-                self._save_job_state(job)
+            duration = None
+            now = time.time()
+            if status in ("active", "processing"):
+                stage_start_times[step_idx] = now
+            elif status in ("completed", "failed") and step_idx in stage_start_times:
+                duration = round(now - stage_start_times[step_idx], 3)
 
-        # Run pipeline synchronously in worker thread
-        result: PipelineExecutionResult = run_pipeline(
-            job_dir=job_dir,
-            left_image_path=left_path,
-            right_image_path=right_path,
-            calibration=calibration,
-            on_step_change=on_step_change,
-        )
+            self.apply_step_update(
+                inspection_id=inspection_id,
+                index=step_idx,
+                step_id=stage_id,
+                status=status,
+                worker=worker_name,
+                duration_sec=duration,
+                message=msg,
+            )
 
-        with self._lock:
-            if inspection_id not in self._jobs:
-                return
-            job = self._jobs[inspection_id]
-            job.processing_duration_sec = result.duration_sec
+        try:
+            result: PipelineExecutionResult = run_pipeline(
+                job_dir=job_dir,
+                left_image_path=left_path,
+                right_image_path=right_path,
+                calibration=calibration,
+                on_step_change=on_step_change,
+            )
+        except Exception as exc:
+            self.apply_failure(
+                inspection_id=inspection_id,
+                message=str(exc),
+                worker=worker_name,
+            )
+            return
 
-            if result.success:
-                job.status = "completed"
-                job.current_step_index = 5
-                job.point_count = result.point_count
-                job.point_cloud_url = f"/api/inspections/{inspection_id}/artifacts/pointcloud.ply"
-                job.mesh_status = result.mesh_status
-                job.mesh_error = result.mesh_error
-                if result.mesh_path and result.mesh_path.exists():
-                    job.mesh_url = f"/api/inspections/{inspection_id}/artifacts/mesh.ply"
-                    job.triangle_count = result.triangle_count
-                else:
-                    job.mesh_url = None
-                    job.triangle_count = None
-
-                if result.deviation_heatmap_path and result.deviation_heatmap_path.exists():
-                    job.deviation_heatmap_url = f"/api/inspections/{inspection_id}/artifacts/deviation_heatmap.png"
-                else:
-                    job.deviation_heatmap_url = None
-
-                job.deviation_summary = result.deviation_summary
-
-                job.failure_message = None
-                job.findings = result.findings or []
-                job.classifier_status = result.classifier_status
-                job.classifier_error = result.classifier_error
-                for f in job.findings:
-                    if f.image_crop_url and "/api/inspections/" in f.image_crop_url:
-                        parts = f.image_crop_url.split("/")
-                        if len(parts) >= 5 and parts[2] == "inspections":
-                            parts[3] = inspection_id
-                            f.image_crop_url = "/".join(parts)
-                for s in job.steps:
-                    s.status = "completed"
-            else:
-                job.status = "failed"
-                job.failure_message = result.failure_message
-                if result.failed_stage_index is not None and result.failed_stage_index < len(job.steps):
-                    job.steps[result.failed_stage_index].status = "failed"
-
-            self._save_job_state(job)
+        if result.success:
+            self.apply_result(
+                inspection_id=inspection_id,
+                point_count=result.point_count,
+                mesh_status=result.mesh_status or "completed",
+                mesh_error=result.mesh_error,
+                triangle_count=result.triangle_count,
+                deviation_summary=result.deviation_summary,
+                findings=result.findings or [],
+                classifier_status=result.classifier_status,
+                classifier_error=result.classifier_error,
+                duration_sec=result.duration_sec,
+                worker=worker_name,
+            )
+        else:
+            self.apply_failure(
+                inspection_id=inspection_id,
+                message=result.failure_message or "Pipeline execution failed",
+                failed_stage_index=result.failed_stage_index,
+                worker=worker_name,
+            )
 
     def get_job(self, inspection_id: str) -> Optional[InspectionResponse]:
         with self._lock:

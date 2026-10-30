@@ -22,6 +22,8 @@ import type {
   PipelineStep,
   Finding,
   DeviationSummary,
+  ClusterWorkersResponse,
+  ClusterSummaryResponse,
 } from '../types/inspection';
 import { MOCK_INSPECTIONS, DEFAULT_PIPELINE_STEPS } from './mockData';
 
@@ -556,4 +558,78 @@ export function updateInspectionProgress(
   all[index] = inspection;
   saveStoredDemoInspections(all);
   return inspection;
+}
+
+/**
+ * Queries cluster worker status from GET /api/cluster/workers.
+ * Falls back safely in demo mode or if cluster route returns local mode.
+ */
+export async function fetchClusterWorkers(): Promise<ClusterWorkersResponse> {
+  const currentMode = getExecutionMode();
+  if (currentMode === 'demo') {
+    return {
+      mode: 'local',
+      workers: [
+        {
+          name: 'demo-local-worker',
+          online: true,
+          activeJobs: [],
+          tasksDone: getStoredDemoInspections().length,
+        },
+      ],
+    };
+  }
+
+  const baseUrl = getBackendBaseUrl();
+  const url = `${baseUrl}/api/cluster/workers`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Failed to fetch cluster workers: HTTP ${res.status}`);
+  }
+  const data = await res.json();
+  return {
+    mode: (data.mode as 'local' | 'celery') || 'local',
+    workers: (data.workers || []).map((w: any) => ({
+      name: String(w.name || ''),
+      online: Boolean(w.online),
+      activeJobs: Array.isArray(w.active_jobs) ? w.active_jobs.map(String) : [],
+      tasksDone: Number(w.tasks_done || 0),
+    })),
+  };
+}
+
+/**
+ * Queries cluster job queue and execution summary from GET /api/cluster/summary.
+ */
+export async function fetchClusterSummary(): Promise<ClusterSummaryResponse> {
+  const currentMode = getExecutionMode();
+  if (currentMode === 'demo') {
+    const demoJobs = getStoredDemoInspections();
+    return {
+      mode: 'local',
+      totalJobs: demoJobs.length,
+      queued: demoJobs.filter((j) => j.status === 'queued').length,
+      processing: demoJobs.filter((j) => j.status === 'processing').length,
+      completed: demoJobs.filter((j) => j.status === 'completed').length,
+      failed: demoJobs.filter((j) => j.status === 'failed').length,
+      activeAssignments: {},
+    };
+  }
+
+  const baseUrl = getBackendBaseUrl();
+  const url = `${baseUrl}/api/cluster/summary`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Failed to fetch cluster summary: HTTP ${res.status}`);
+  }
+  const data = await res.json();
+  return {
+    mode: (data.mode as 'local' | 'celery') || 'local',
+    totalJobs: Number(data.total_jobs || 0),
+    queued: Number(data.queued || 0),
+    processing: Number(data.processing || 0),
+    completed: Number(data.completed || 0),
+    failed: Number(data.failed || 0),
+    activeAssignments: data.active_assignments || {},
+  };
 }
