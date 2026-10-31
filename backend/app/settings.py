@@ -99,6 +99,42 @@ def get_mesh_depth() -> int:
         return 8
 
 
+def get_heartbeat_interval() -> float:
+    """Returns interval in seconds between worker heartbeats (default: 10.0)."""
+    try:
+        val = float(os.getenv("SURFACE_HEARTBEAT_INTERVAL", "10.0"))
+        return val if val > 0 else 10.0
+    except (ValueError, TypeError):
+        return 10.0
+
+
+def get_lease_timeout() -> float:
+    """Returns threshold in seconds for worker heartbeat expiration (default: 35.0)."""
+    try:
+        val = float(os.getenv("SURFACE_LEASE_TIMEOUT", "35.0"))
+        return val if val > 0 else 35.0
+    except (ValueError, TypeError):
+        return 35.0
+
+
+def get_supervisor_interval() -> float:
+    """Returns recovery supervisor check interval in seconds (default: 5.0)."""
+    try:
+        val = float(os.getenv("SURFACE_SUPERVISOR_INTERVAL", "5.0"))
+        return val if val > 0 else 5.0
+    except (ValueError, TypeError):
+        return 5.0
+
+
+def get_offline_grace_period() -> float:
+    """Returns grace period in seconds before reassigning offline or silent worker (default: 15.0)."""
+    try:
+        val = float(os.getenv("SURFACE_OFFLINE_GRACE_PERIOD", "15.0"))
+        return val if val >= 0 else 15.0
+    except (ValueError, TypeError):
+        return 15.0
+
+
 # Module-level __getattr__ enables direct access like `settings.SURFACE_EXECUTION`
 # while dynamically evaluating os.getenv at access time.
 def __getattr__(name: str):
@@ -128,4 +164,12 @@ def __getattr__(name: str):
         return get_dev_min_area_px()
     if name == "SURFACE_MESH_DEPTH":
         return get_mesh_depth()
+    if name == "SURFACE_HEARTBEAT_INTERVAL":
+        return get_heartbeat_interval()
+    if name == "SURFACE_LEASE_TIMEOUT":
+        return get_lease_timeout()
+    if name == "SURFACE_SUPERVISOR_INTERVAL":
+        return get_supervisor_interval()
+    if name == "SURFACE_OFFLINE_GRACE_PERIOD":
+        return get_offline_grace_period()
     raise AttributeError(f"module '{__name__}' has no attribute '{name}'")

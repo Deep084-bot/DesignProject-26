@@ -133,11 +133,14 @@ async def create_inspection(
         raw_calibration_bytes=calib_bytes,
     )
 
-    # 7. In Celery mode, enqueue task to Celery / Redis
+    # 7. In Celery mode, enqueue task to Celery / Redis using crash-safe outbox
     if settings.get_execution_mode() == "celery":
         try:
+            job_manager.write_outbox_intent(inspection_id, inspection.lease_token)
             from ..tasks import run_inspection_task
-            run_inspection_task.delay(inspection_id)
+            run_inspection_task.delay(inspection_id, inspection.lease_token)
+            job_manager.mark_outbox_published(inspection_id, inspection.lease_token)
+            job_manager.cleanup_outbox(inspection_id, inspection.lease_token)
         except Exception as exc:
             job_manager.apply_failure(
                 inspection_id=inspection_id,

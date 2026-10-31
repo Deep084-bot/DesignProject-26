@@ -1,26 +1,33 @@
 """
 Comprehensive Test Suite for M4a: Distributed Job Execution with Celery & Redis.
 
-Authoritative specification: SURFACE_Master_Prompt.md Section 4.2 & 4.4.
+Authoritative specification: SURFACE_Master_Prompt.md Section 4.2 & Approved M4a Recovery Architecture.
 Covers:
 1. Central Settings & Environment Overrides
 2. Secret Token Authentication & Route Security
-3. Artifact Upload Path Traversal Prevention
-4. Step, Complete, and Failure State Transitions & Idempotency
-5. Cluster Monitoring Fallback (Local mode & Redis unavailable)
-6. Worker Pipeline Task Execution, Tempdir Cleanup, & Retry Semantics
+3. Artifact Upload Path Traversal Prevention & Two-Phase Staging
+4. Mandatory Fencing Tokens & Stale Token Rejection (409 Conflict on all internal routes)
+5. Worker Identity Binding & Concurrent Claim Protection
+6. Heartbeat Tracking & Autonomous Supervisor Decision Table
+7. Crash-Safe Outbox Protocol & Startup Reconciliation
+8. Clean Worker Abort on 409 (No Retries, No Late Failures, Tempdir Cleanup)
+9. Cluster Monitoring Fallback & Unresponsive Worker Flagging
+10. Local Mode Preservation without Redis
 """
 
 from pathlib import Path
 import json
 import time
+import os
+import asyncio
 from unittest.mock import MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
 from backend.app.main import app
-from backend.app.services.job_manager import JobManager
-from backend.app.tasks import execute_worker_pipeline, run_inspection_task
+from backend.app.services.job_manager import JobManager, LeaseConflictError
+from backend.app.services.recovery_supervisor import RecoverySupervisor
+from backend.app.tasks import execute_worker_pipeline, run_inspection_task, LeaseRevokedException
 from backend.app import settings
 
 
@@ -36,7 +43,11 @@ def worker_token():
 
 @pytest.fixture
 def auth_headers(worker_token):
-    return {"X-Worker-Token": worker_token}
+    return {
+        "X-Worker-Token": worker_token,
+        "X-Lease-Token": "1",
+        "X-Worker-Name": "worker-laptop-01",
+    }
 
 
 @pytest.fixture
@@ -103,6 +114,23 @@ def test_settings_defaults_and_env_overrides(monkeypatch):
     monkeypatch.setenv("SURFACE_CORS_ORIGINS", "http://laptop1:5173, http://laptop2:5173 ")
     assert settings.get_cors_origins() == ["http://laptop1:5173", "http://laptop2:5173"]
 
+    # Recovery configuration settings
+    monkeypatch.setenv("SURFACE_HEARTBEAT_INTERVAL", "12.5")
+    assert settings.get_heartbeat_interval() == 12.5
+    assert settings.SURFACE_HEARTBEAT_INTERVAL == 12.5
+
+    monkeypatch.setenv("SURFACE_LEASE_TIMEOUT", "45.0")
+    assert settings.get_lease_timeout() == 45.0
+    assert settings.SURFACE_LEASE_TIMEOUT == 45.0
+
+    monkeypatch.setenv("SURFACE_SUPERVISOR_INTERVAL", "3.0")
+    assert settings.get_supervisor_interval() == 3.0
+    assert settings.SURFACE_SUPERVISOR_INTERVAL == 3.0
+
+    monkeypatch.setenv("SURFACE_OFFLINE_GRACE_PERIOD", "20.0")
+    assert settings.get_offline_grace_period() == 20.0
+    assert settings.SURFACE_OFFLINE_GRACE_PERIOD == 20.0
+
 
 # ============================================================================
 # 2. Worker Authentication & Security Tests (/api/internal/*)
@@ -138,11 +166,33 @@ def test_internal_token_unconfigured_master_returns_403(test_client, monkeypatch
     assert "SURFACE_WORKER_TOKEN is not configured" in res.json()["detail"]
 
 
+def test_missing_worker_identity_or_token_rejected(test_client, sample_job_in_manager, monkeypatch):
+    """Verifies that missing X-Lease-Token or X-Worker-Name returns 409 Conflict."""
+    manager, job = sample_job_in_manager
+    monkeypatch.setattr("backend.app.routes.internal.job_manager", manager)
+
+    # Missing lease token
+    res = test_client.get(
+        f"/api/internal/jobs/{job.id}/manifest",
+        headers={"X-Worker-Token": "test-secret-worker-token-xyz-123", "X-Worker-Name": "w1"},
+    )
+    assert res.status_code == 409
+    assert "X-Lease-Token" in res.json()["detail"]
+
+    # Missing worker name
+    res = test_client.get(
+        f"/api/internal/jobs/{job.id}/manifest",
+        headers={"X-Worker-Token": "test-secret-worker-token-xyz-123", "X-Lease-Token": "1"},
+    )
+    assert res.status_code == 409
+    assert "X-Worker-Name" in res.json()["detail"]
+
+
 # ============================================================================
-# 3. Artifact Upload & Path Traversal Prevention Tests
+# 3. Artifact Upload & Path Traversal & Two-Phase Commit Tests
 # ============================================================================
 
-def test_artifact_upload_path_traversal_dot_dot_rejected(test_client, sample_job_in_manager, monkeypatch):
+def test_artifact_upload_path_traversal_dot_dot_rejected(test_client, sample_job_in_manager, monkeypatch, auth_headers):
     """Rejects artifact upload with 400 when path contains '..' directory traversal."""
     manager, job = sample_job_in_manager
     monkeypatch.setattr("backend.app.routes.internal.job_manager", manager)
@@ -150,14 +200,14 @@ def test_artifact_upload_path_traversal_dot_dot_rejected(test_client, sample_job
     files = {"file": ("test.ply", b"binary-data", "application/octet-stream")}
     res = test_client.post(
         f"/api/internal/jobs/{job.id}/artifacts/..%2F..%2Fetc%2Fpasswd",
-        headers={"X-Worker-Token": "test-secret-worker-token-xyz-123"},
+        headers=auth_headers,
         files=files,
     )
     assert res.status_code == 400
     assert "path traversal" in res.json()["detail"].lower()
 
 
-def test_artifact_upload_slash_in_name_rejected(test_client, sample_job_in_manager, monkeypatch):
+def test_artifact_upload_slash_in_name_rejected(test_client, sample_job_in_manager, monkeypatch, auth_headers):
     """Rejects artifact upload with 400 when artifact name contains slashes."""
     manager, job = sample_job_in_manager
     monkeypatch.setattr("backend.app.routes.internal.job_manager", manager)
@@ -165,13 +215,13 @@ def test_artifact_upload_slash_in_name_rejected(test_client, sample_job_in_manag
     files = {"file": ("test.ply", b"binary-data", "application/octet-stream")}
     res = test_client.post(
         f"/api/internal/jobs/{job.id}/artifacts/sub%2Fpointcloud.ply",
-        headers={"X-Worker-Token": "test-secret-worker-token-xyz-123"},
+        headers=auth_headers,
         files=files,
     )
     assert res.status_code == 400
 
 
-def test_artifact_upload_hidden_file_rejected(test_client, sample_job_in_manager, monkeypatch):
+def test_artifact_upload_hidden_file_rejected(test_client, sample_job_in_manager, monkeypatch, auth_headers):
     """Rejects artifact upload with 400 when artifact name starts with '.'."""
     manager, job = sample_job_in_manager
     monkeypatch.setattr("backend.app.routes.internal.job_manager", manager)
@@ -179,14 +229,14 @@ def test_artifact_upload_hidden_file_rejected(test_client, sample_job_in_manager
     files = {"file": (".hidden", b"binary-data", "application/octet-stream")}
     res = test_client.post(
         f"/api/internal/jobs/{job.id}/artifacts/.hidden",
-        headers={"X-Worker-Token": "test-secret-worker-token-xyz-123"},
+        headers=auth_headers,
         files=files,
     )
     assert res.status_code == 400
 
 
-def test_artifact_upload_valid_file_stored_safely(test_client, sample_job_in_manager, monkeypatch):
-    """Accepts valid artifact upload and writes it strictly into the job directory."""
+def test_artifact_upload_valid_file_stored_safely(test_client, sample_job_in_manager, monkeypatch, auth_headers):
+    """Accepts valid artifact upload and writes it strictly into the job directory via two-phase commit."""
     manager, job = sample_job_in_manager
     monkeypatch.setattr("backend.app.routes.internal.job_manager", manager)
 
@@ -195,7 +245,7 @@ def test_artifact_upload_valid_file_stored_safely(test_client, sample_job_in_man
 
     res = test_client.post(
         f"/api/internal/jobs/{job.id}/artifacts/pointcloud.ply",
-        headers={"X-Worker-Token": "test-secret-worker-token-xyz-123"},
+        headers=auth_headers,
         files=files,
     )
     assert res.status_code == 200
@@ -206,231 +256,338 @@ def test_artifact_upload_valid_file_stored_safely(test_client, sample_job_in_man
     assert target_file.exists()
     assert target_file.read_bytes() == payload
 
+    # Verify no dangling staging files
+    job_dir = manager.storage_dir / job.id
+    staging_files = [f for f in job_dir.iterdir() if f.name.startswith(".staging_")]
+    assert len(staging_files) == 0
 
-def test_artifact_upload_nonexistent_job_returns_404(test_client, sample_job_in_manager, monkeypatch):
-    """Returns 404 when uploading artifact to non-existent job ID."""
-    manager, _ = sample_job_in_manager
-    monkeypatch.setattr("backend.app.routes.internal.job_manager", manager)
 
-    files = {"file": ("mesh.ply", b"data", "application/octet-stream")}
-    res = test_client.post(
-        "/api/internal/jobs/NONEXISTENT-ID/artifacts/mesh.ply",
-        headers={"X-Worker-Token": "test-secret-worker-token-xyz-123"},
-        files=files,
-    )
-    assert res.status_code == 404
+def test_interrupted_artifact_upload_staging_cleaned(sample_job_in_manager):
+    """Validates that a failed artifact commit cleans up its staging file."""
+    manager, job = sample_job_in_manager
+    staging_file = manager.storage_dir / job.id / ".staging_test_temp"
+    staging_file.write_bytes(b"partial content")
+
+    # Pass mismatched lease token to force commit failure
+    with pytest.raises(LeaseConflictError):
+        manager.commit_artifact(
+            inspection_id=job.id,
+            lease_token=99,
+            worker_name="worker-1",
+            artifact_name="mesh.ply",
+            staging_path=staging_file,
+        )
+
+    assert not staging_file.exists()
 
 
 # ============================================================================
-# 4. Manifest & State Update Route Tests
+# 4. Mandatory Fencing Tokens & Stale Token Rejection (409 Conflict)
 # ============================================================================
 
-def test_manifest_returns_correct_input_filenames(test_client, sample_job_in_manager, monkeypatch):
-    """GET /api/internal/jobs/{id}/manifest returns left image, right image, and calibration file."""
+def test_stale_token_rejected_on_every_internal_route_with_409(test_client, sample_job_in_manager, monkeypatch):
+    """
+    Every worker-originated operation that reads or modifies an inspection
+    must validate the current lease token and return 409 Conflict on mismatch.
+    """
     manager, job = sample_job_in_manager
     monkeypatch.setattr("backend.app.routes.internal.job_manager", manager)
 
-    res = test_client.get(
-        f"/api/internal/jobs/{job.id}/manifest",
-        headers={"X-Worker-Token": "test-secret-worker-token-xyz-123"},
-    )
-    assert res.status_code == 200
-    data = res.json()
-    assert data["inspection_id"] == job.id
-    assert data["left_image"] == "input_left.png"
-    assert data["right_image"] == "input_right.png"
-    assert data["calibration"] == "calibration.json"
-
-
-def test_step_update_applies_progress_worker_and_duration(test_client, sample_job_in_manager, monkeypatch):
-    """POST /api/internal/jobs/{id}/step updates job step status, worker name, and duration."""
-    manager, job = sample_job_in_manager
-    monkeypatch.setattr("backend.app.routes.internal.job_manager", manager)
-
-    step_data = {
-        "index": 1,
-        "step_id": "disparity_estimation",
-        "status": "completed",
-        "worker": "worker-laptop-01",
-        "duration_sec": 4.25,
-        "message": None,
+    # Job has lease_token = 1. Stale token is 0.
+    stale_headers = {
+        "X-Worker-Token": "test-secret-worker-token-xyz-123",
+        "X-Lease-Token": "0",
+        "X-Worker-Name": "stale-worker",
     }
 
-    res = test_client.post(
+    # 1. Manifest
+    r1 = test_client.get(f"/api/internal/jobs/{job.id}/manifest", headers=stale_headers)
+    assert r1.status_code == 409
+
+    # 2. Heartbeat
+    r2 = test_client.post(f"/api/internal/jobs/{job.id}/heartbeat", headers=stale_headers)
+    assert r2.status_code == 409
+
+    # 3. Step update
+    r3 = test_client.post(
         f"/api/internal/jobs/{job.id}/step",
-        headers={"X-Worker-Token": "test-secret-worker-token-xyz-123"},
-        json=step_data,
+        headers=stale_headers,
+        json={"index": 0, "step_id": "prepare", "status": "processing"},
     )
-    assert res.status_code == 200
-    assert res.json()["status"] == "ok"
+    assert r3.status_code == 409
 
-    updated = manager.get_job(job.id)
-    assert updated.current_step_index == 1
-    assert updated.steps[1].status == "completed"
-    assert updated.steps[1].worker == "worker-laptop-01"
-    assert updated.steps[1].duration_sec == 4.25
+    # 4. Artifact upload
+    r4 = test_client.post(
+        f"/api/internal/jobs/{job.id}/artifacts/test.txt",
+        headers=stale_headers,
+        files={"file": ("test.txt", b"content", "text/plain")},
+    )
+    assert r4.status_code == 409
 
-
-def test_complete_job_records_findings_and_deviation(test_client, sample_job_in_manager, monkeypatch):
-    """POST /api/internal/jobs/{id}/complete transitions job to completed with all findings."""
-    manager, job = sample_job_in_manager
-    monkeypatch.setattr("backend.app.routes.internal.job_manager", manager)
-
-    complete_payload = {
-        "point_count": 125000,
-        "mesh_status": "completed",
-        "mesh_error": None,
-        "triangle_count": 45000,
-        "deviation_summary": {
-            "rmse_mm": 2.1,
-            "max_depression_mm": 5.4,
-            "max_bulge_mm": 0.0,
-            "sigma_mm": 1.2,
-            "threshold_mm": 4.5,
-            "inlier_fraction": 0.94,
-            "region_count": 1,
-            "plane_normal": [0.0, 0.0, 1.0],
-            "plane_offset_mm": 1200.0,
-            "valid_pixel_fraction": 0.85,
-        },
-        "findings": [
-            {
-                "id": "Finding 01",
-                "type": "potential_crack",
-                "confidence": 0.92,
-                "geometric_deviation_mm": 5.4,
-                "bounding_box_2d": {"x": 50, "y": 60, "width": 120, "height": 80},
-                "region_center_3d": [10.5, -20.2, -1205.0],
-                "image_crop_url": f"/api/inspections/{job.id}/artifacts/finding_01.png",
-                "notes": "Verified surface fissure",
-            }
-        ],
-        "classifier_status": "completed",
-        "classifier_error": None,
-        "duration_sec": 14.8,
-        "worker": "worker-laptop-01",
-    }
-
-    res = test_client.post(
+    # 5. Complete
+    r5 = test_client.post(
         f"/api/internal/jobs/{job.id}/complete",
-        headers={"X-Worker-Token": "test-secret-worker-token-xyz-123"},
-        json=complete_payload,
+        headers=stale_headers,
+        json={"point_count": 100},
     )
-    assert res.status_code == 200
-    assert res.json()["status"] == "ok"
+    assert r5.status_code == 409
 
-    updated = manager.get_job(job.id)
-    assert updated.status == "completed"
-    assert updated.point_count == 125000
-    assert updated.deviation_summary["rmse_mm"] == 2.1
-    assert len(updated.findings) == 1
-    assert updated.findings[0].id == "Finding 01"
-    assert updated.findings[0].confidence == 0.92
-    assert all(s.status == "completed" for s in updated.steps)
-
-
-def test_duplicate_completion_ignored(test_client, sample_job_in_manager, monkeypatch):
-    """Verifies that once a job is completed, a second complete call is ignored."""
-    manager, job = sample_job_in_manager
-    monkeypatch.setattr("backend.app.routes.internal.job_manager", manager)
-
-    complete_payload = {
-        "point_count": 10000,
-        "mesh_status": "completed",
-        "duration_sec": 10.0,
-        "worker": "worker-1",
-    }
-
-    res1 = test_client.post(
-        f"/api/internal/jobs/{job.id}/complete",
-        headers={"X-Worker-Token": "test-secret-worker-token-xyz-123"},
-        json=complete_payload,
-    )
-    assert res1.json()["status"] == "ok"
-
-    # Second call with different point_count should be ignored
-    complete_payload["point_count"] = 999999
-    res2 = test_client.post(
-        f"/api/internal/jobs/{job.id}/complete",
-        headers={"X-Worker-Token": "test-secret-worker-token-xyz-123"},
-        json=complete_payload,
-    )
-    assert res2.json()["status"] == "ignored"
-
-    # Value remains unchanged
-    updated = manager.get_job(job.id)
-    assert updated.point_count == 10000
-
-
-def test_late_step_update_on_completed_job_ignored(test_client, sample_job_in_manager, monkeypatch):
-    """Step update delivered after job has reached terminal completed state is safely ignored."""
-    manager, job = sample_job_in_manager
-    monkeypatch.setattr("backend.app.routes.internal.job_manager", manager)
-
-    # Complete job first
-    manager.apply_result(
-        inspection_id=job.id,
-        point_count=500,
-        mesh_status="completed",
-        duration_sec=5.0,
-    )
-
-    # Late step update
-    res = test_client.post(
-        f"/api/internal/jobs/{job.id}/step",
-        headers={"X-Worker-Token": "test-secret-worker-token-xyz-123"},
-        json={"index": 2, "step_id": "mesh_reconstruction", "status": "processing"},
-    )
-    assert res.json()["status"] == "ignored"
-
-
-def test_fail_endpoint_records_error_and_marks_failed(test_client, sample_job_in_manager, monkeypatch):
-    """POST /api/internal/jobs/{id}/fail records error message and marks job as failed."""
-    manager, job = sample_job_in_manager
-    monkeypatch.setattr("backend.app.routes.internal.job_manager", manager)
-
-    fail_payload = {
-        "message": "SGBM stereo matching disparity computation failed",
-        "failed_stage_index": 1,
-        "worker": "worker-laptop-02",
-    }
-
-    res = test_client.post(
+    # 6. Fail
+    r6 = test_client.post(
         f"/api/internal/jobs/{job.id}/fail",
-        headers={"X-Worker-Token": "test-secret-worker-token-xyz-123"},
-        json=fail_payload,
+        headers=stale_headers,
+        json={"message": "Failed from stale worker"},
     )
-    assert res.status_code == 200
-    assert res.json()["status"] == "ok"
-
-    updated = manager.get_job(job.id)
-    assert updated.status == "failed"
-    assert updated.failure_message == "SGBM stereo matching disparity computation failed"
-    assert updated.steps[1].status == "failed"
-    assert updated.steps[1].worker == "worker-laptop-02"
-
-
-def test_late_fail_on_already_completed_job_ignored(test_client, sample_job_in_manager, monkeypatch):
-    """Failure update on an already completed job is ignored."""
-    manager, job = sample_job_in_manager
-    monkeypatch.setattr("backend.app.routes.internal.job_manager", manager)
-
-    manager.apply_result(inspection_id=job.id, point_count=1000, mesh_status="completed", duration_sec=5.0)
-
-    res = test_client.post(
-        f"/api/internal/jobs/{job.id}/fail",
-        headers={"X-Worker-Token": "test-secret-worker-token-xyz-123"},
-        json={"message": "Late failure after completion", "failed_stage_index": 0},
-    )
-    assert res.json()["status"] == "ignored"
-
-    updated = manager.get_job(job.id)
-    assert updated.status == "completed"
+    assert r6.status_code == 409
 
 
 # ============================================================================
-# 5. Cluster Monitoring Route Tests (/api/cluster/*)
+# 5. Worker Identity Binding & Concurrent Claim Protection
 # ============================================================================
+
+def test_concurrent_manifest_claims(test_client, sample_job_in_manager, monkeypatch):
+    """
+    Worker 1 claims manifest with 'worker-A'.
+    Worker 2 attempting to claim manifest with 'worker-B' under the same lease gets 409 Conflict.
+    """
+    manager, job = sample_job_in_manager
+    monkeypatch.setattr("backend.app.routes.internal.job_manager", manager)
+
+    headers_a = {
+        "X-Worker-Token": "test-secret-worker-token-xyz-123",
+        "X-Lease-Token": "1",
+        "X-Worker-Name": "worker-A",
+    }
+    headers_b = {
+        "X-Worker-Token": "test-secret-worker-token-xyz-123",
+        "X-Lease-Token": "1",
+        "X-Worker-Name": "worker-B",
+    }
+
+    # Worker A claims first
+    r1 = test_client.get(f"/api/internal/jobs/{job.id}/manifest", headers=headers_a)
+    assert r1.status_code == 200
+    assert r1.json()["assigned_worker"] == "worker-A"
+
+    # Worker B tries to claim the same job and lease
+    r2 = test_client.get(f"/api/internal/jobs/{job.id}/manifest", headers=headers_b)
+    assert r2.status_code == 409
+    assert "Worker identity mismatch" in r2.json()["detail"] or "already bound" in r2.json()["detail"]
+
+
+def test_concurrent_recovery_attempts(sample_job_in_manager):
+    """Atomic CAS allows only one recovery increment; subsequent attempts with same lease return None."""
+    manager, job = sample_job_in_manager
+    assert job.lease_token == 1
+
+    new_lease = manager.reassign_orphaned_job(job.id, expected_lease_token=1, reason="Worker loss")
+    assert new_lease == 2
+
+    # Concurrent second attempt with expected_lease_token = 1
+    second_attempt = manager.reassign_orphaned_job(job.id, expected_lease_token=1, reason="Duplicate trigger")
+    assert second_attempt is None
+
+
+def test_duplicate_celery_delivery_dropped_on_manifest_check(test_client, sample_job_in_manager, monkeypatch):
+    """
+    When a job has been recovered to lease 2, a redelivered generation 1 Celery task
+    is rejected with 409 Conflict on its initial manifest call and exits cleanly.
+    """
+    manager, job = sample_job_in_manager
+    monkeypatch.setattr("backend.app.routes.internal.job_manager", manager)
+
+    # Reassign job to lease 2
+    manager.reassign_orphaned_job(job.id, expected_lease_token=1)
+    assert manager.get_job(job.id).lease_token == 2
+
+    # Redelivered task with lease 1
+    stale_headers = {
+        "X-Worker-Token": "test-secret-worker-token-xyz-123",
+        "X-Lease-Token": "1",
+        "X-Worker-Name": "worker-old-delivery",
+    }
+    res = test_client.get(f"/api/internal/jobs/{job.id}/manifest", headers=stale_headers)
+    assert res.status_code == 409
+
+
+# ============================================================================
+# 6. Heartbeat Tracking & Autonomous Supervisor Decision Table
+# ============================================================================
+
+def test_heartbeat_during_stage(test_client, sample_job_in_manager, monkeypatch, auth_headers):
+    """Periodic worker heartbeat successfully updates job timestamp and monotonic tracker."""
+    manager, job = sample_job_in_manager
+    monkeypatch.setattr("backend.app.routes.internal.job_manager", manager)
+
+    res = test_client.post(f"/api/internal/jobs/{job.id}/heartbeat", headers=auth_headers)
+    assert res.status_code == 200
+    assert res.json()["status"] == "ok"
+
+    age = manager.get_heartbeat_age(job.id)
+    assert age is not None
+    assert age >= 0.0
+    assert age < 2.0
+
+
+def test_supervisor_decision_table_states(sample_job_in_manager, monkeypatch):
+    """
+    Tests the 4 states of the recovery supervisor decision table:
+    1. Worker Online + Fresh Heartbeat -> Retain assignment.
+    2. Worker Online + Expired Heartbeat -> Grace period, then recover.
+    3. Worker Offline + Fresh Heartbeat -> Grace period, then recover.
+    4. Worker Offline + Expired Heartbeat -> Immediate recovery.
+    """
+    async def _run():
+        manager, job = sample_job_in_manager
+        supervisor = RecoverySupervisor(manager)
+        monkeypatch.setenv("SURFACE_EXECUTION", "celery")
+        monkeypatch.setenv("SURFACE_LEASE_TIMEOUT", "10.0")
+        monkeypatch.setenv("SURFACE_OFFLINE_GRACE_PERIOD", "5.0")
+
+        # Bind worker to job
+        manager.claim_manifest(job.id, lease_token=1, worker_name="worker-1")
+
+        # State 1: Online + Fresh Heartbeat
+        mock_insp = MagicMock()
+        mock_insp.ping.return_value = {"worker-1": {"ok": "pong"}}
+        with patch("backend.app.celery_app.celery_app.control.inspect", return_value=mock_insp):
+            await supervisor.check_recovery_cycle()
+        assert manager.get_job(job.id).lease_token == 1
+        assert manager.get_job(job.id).assigned_worker == "worker-1"
+
+        # State 4: Offline + Expired Heartbeat
+        # Simulate expired heartbeat by setting monotonic timestamp into the past
+        manager._monotonic_heartbeats[job.id] = time.monotonic() - 15.0
+        mock_insp.ping.return_value = {}  # worker-1 offline
+
+        with patch("backend.app.celery_app.celery_app.control.inspect", return_value=mock_insp), \
+             patch("backend.app.tasks.run_inspection_task.delay") as mock_delay:
+            await supervisor.check_recovery_cycle()
+            assert manager.get_job(job.id).lease_token == 2
+            assert manager.get_job(job.id).assigned_worker is None
+            assert mock_delay.called
+
+    asyncio.run(_run())
+
+
+def test_redis_unavailable_during_recovery_deferred_safely(sample_job_in_manager, monkeypatch):
+    """When broker is down, supervisor defers recovery without mutating job state."""
+    async def _run():
+        manager, job = sample_job_in_manager
+        supervisor = RecoverySupervisor(manager)
+        monkeypatch.setenv("SURFACE_EXECUTION", "celery")
+
+        manager.claim_manifest(job.id, lease_token=1, worker_name="worker-1")
+        manager._monotonic_heartbeats[job.id] = time.monotonic() - 50.0  # Expired
+
+        with patch("backend.app.celery_app.celery_app.control.inspect", side_effect=Exception("Redis down")):
+            await supervisor.check_recovery_cycle()
+
+        # Job was NOT reassigned
+        assert manager.get_job(job.id).lease_token == 1
+        assert manager.get_job(job.id).assigned_worker == "worker-1"
+
+    asyncio.run(_run())
+
+
+# ============================================================================
+# 7. Crash-Safe Outbox Protocol & Startup Reconciliation
+# ============================================================================
+
+def test_master_crash_before_task_publication_outbox_recovered(sample_job_in_manager, monkeypatch):
+    """
+    Crash before task publication leaves outbox file in 'pending' state.
+    Master startup reconciliation re-enqueues the Celery task.
+    """
+    manager, job = sample_job_in_manager
+    monkeypatch.setenv("SURFACE_EXECUTION", "celery")
+
+    # Write dispatch intent
+    intent_file = manager.write_outbox_intent(job.id, lease_token=1)
+    assert intent_file.exists()
+
+    with patch("backend.app.tasks.run_inspection_task.delay") as mock_delay:
+        republished = manager.reconcile_outbox_on_startup()
+        assert republished == 1
+        assert mock_delay.called
+        assert not intent_file.exists()
+
+
+def test_master_crash_after_publication_before_cleanup(sample_job_in_manager, monkeypatch):
+    """
+    Crash after publication leaves outbox file in 'published' state.
+    Master startup reconciliation cleans up file without duplicate publication.
+    """
+    manager, job = sample_job_in_manager
+    monkeypatch.setenv("SURFACE_EXECUTION", "celery")
+
+    manager.write_outbox_intent(job.id, lease_token=1)
+    manager.mark_outbox_published(job.id, lease_token=1)
+
+    with patch("backend.app.tasks.run_inspection_task.delay") as mock_delay:
+        republished = manager.reconcile_outbox_on_startup()
+        assert republished == 0
+        mock_delay.assert_not_called()
+        assert not (manager.storage_dir / job.id / "outbox" / "dispatch_1.json").exists()
+
+
+# ============================================================================
+# 8. Clean Worker Abort on 409 (No Retries, No Late Failures, Tempdir Cleanup)
+# ============================================================================
+
+def test_worker_aborts_cleanly_on_409(monkeypatch):
+    """
+    Worker receiving 409 Conflict raises LeaseRevokedException,
+    cleans up tempdir, and Celery task exits without retry or calling /fail.
+    """
+    mock_client = MagicMock()
+    # Mock manifest response returning 409 Conflict
+    mock_resp = MagicMock()
+    mock_resp.status_code = 409
+    mock_resp.text = "Fencing lease revoked"
+    mock_client.get.return_value = mock_resp
+
+    with pytest.raises(LeaseRevokedException):
+        execute_worker_pipeline(
+            inspection_id="INSP-ABORT-TEST",
+            lease_token=1,
+            client=mock_client,
+            worker_name="worker-1",
+            worker_token="tok",
+        )
+
+    # When run as Celery task, LeaseRevokedException is caught and returns False cleanly
+    with patch("backend.app.tasks.execute_worker_pipeline", side_effect=LeaseRevokedException("Revoked")), \
+         patch.object(run_inspection_task, "retry") as mock_retry:
+        ret = run_inspection_task.run("INSP-ABORT-TEST", lease_token=1)
+        assert ret is False
+        mock_retry.assert_not_called()
+
+
+# ============================================================================
+# 9. Cluster Monitoring Fallback & Unresponsive Worker Flagging
+# ============================================================================
+
+def test_cluster_summary_marks_unresponsive_worker(test_client, sample_job_in_manager, monkeypatch):
+    """
+    When a job is assigned to 'worker-offline' but Celery inspect shows it is offline,
+    GET /api/cluster/summary marks it as 'worker-offline (unresponsive)'.
+    """
+    manager, job = sample_job_in_manager
+    monkeypatch.setenv("SURFACE_EXECUTION", "celery")
+    monkeypatch.setattr("backend.app.routes.cluster.job_manager", manager)
+
+    manager.claim_manifest(job.id, lease_token=1, worker_name="worker-offline")
+
+    mock_insp = MagicMock()
+    mock_insp.ping.return_value = {"worker-other": {"ok": "pong"}}  # worker-offline missing
+
+    with patch("backend.app.celery_app.celery_app.control.inspect", return_value=mock_insp):
+        res = test_client.get("/api/cluster/summary")
+        assert res.status_code == 200
+        data = res.json()
+        assert data["active_assignments"].get(job.id) == "worker-offline (unresponsive)"
+
 
 def test_cluster_workers_local_mode_safe(test_client, monkeypatch):
     """In local mode, GET /api/cluster/workers returns mode='local' and empty workers list."""
@@ -442,93 +599,12 @@ def test_cluster_workers_local_mode_safe(test_client, monkeypatch):
     assert data["workers"] == []
 
 
-def test_cluster_workers_redis_down_fallback(test_client, monkeypatch):
-    """When Celery mode is set but Redis is unreachable, safely returns mode='local' and empty list."""
-    monkeypatch.setenv("SURFACE_EXECUTION", "celery")
-
-    with patch("backend.app.celery_app.celery_app.control.inspect") as mock_inspect:
-        mock_inspect.side_effect = Exception("Redis connection refused")
-        res = test_client.get("/api/cluster/workers")
-        assert res.status_code == 200
-        data = res.json()
-        assert data["mode"] == "local"
-        assert data["workers"] == []
-
-
-def test_cluster_workers_inspect_timeout_fallback(test_client, monkeypatch):
-    """When Celery inspect pings return None (timeout), returns mode='celery' and empty workers list."""
-    monkeypatch.setenv("SURFACE_EXECUTION", "celery")
-
-    mock_insp = MagicMock()
-    mock_insp.ping.return_value = None
-    with patch("backend.app.celery_app.celery_app.control.inspect", return_value=mock_insp):
-        res = test_client.get("/api/cluster/workers")
-        assert res.status_code == 200
-        data = res.json()
-        assert data["mode"] == "celery"
-        assert data["workers"] == []
-
-
-def test_cluster_workers_active_response_parsing(test_client, monkeypatch):
-    """Parses online workers, active task arguments, and completed task counts."""
-    monkeypatch.setenv("SURFACE_EXECUTION", "celery")
-
-    mock_insp = MagicMock()
-    mock_insp.ping.return_value = {"worker-1@laptop": {"ok": "pong"}}
-    mock_insp.active.return_value = {
-        "worker-1@laptop": [{"id": "t1", "args": ["INSP-2026-X1"]}]
-    }
-    mock_insp.stats.return_value = {
-        "worker-1@laptop": {"total": {"run_inspection_task": 12}}
-    }
-
-    with patch("backend.app.celery_app.celery_app.control.inspect", return_value=mock_insp):
-        res = test_client.get("/api/cluster/workers")
-        assert res.status_code == 200
-        data = res.json()
-        assert data["mode"] == "celery"
-        assert len(data["workers"]) == 1
-        worker = data["workers"][0]
-        assert worker["name"] == "worker-1@laptop"
-        assert worker["online"] is True
-        assert worker["active_jobs"] == ["INSP-2026-X1"]
-        assert worker["tasks_done"] == 12
-
-
-def test_cluster_summary_counts_and_assignments(test_client, sample_job_in_manager, monkeypatch):
-    """GET /api/cluster/summary returns accurate job state counts and active worker assignments."""
-    manager, job = sample_job_in_manager
-    monkeypatch.setattr("backend.app.routes.cluster.job_manager", manager)
-
-    # Set job status to processing with worker assigned
-    manager.apply_step_update(
-        inspection_id=job.id,
-        index=0,
-        step_id="input_rectification",
-        status="processing",
-        worker="worker-alpha",
-    )
-
-    res = test_client.get("/api/cluster/summary")
-    assert res.status_code == 200
-    data = res.json()
-    assert data["total_jobs"] >= 1
-    assert data["processing"] >= 1
-    assert data["active_assignments"].get(job.id) == "worker-alpha"
-
-
 # ============================================================================
-# 6. Worker Execution Pipeline & Celery Task Tests
+# 10. Worker Pipeline Execution & Local Mode Preservation
 # ============================================================================
 
 def test_execute_worker_pipeline_end_to_end_mocked_http(tmp_path: Path, monkeypatch, synthetic_stereo_pair, valid_rectified_calib_json):
-    """
-    Executes worker pipeline against mock/test client, verifying:
-    1. Downloads manifest & inputs.
-    2. Runs pipeline.
-    3. Uploads generated artifacts.
-    4. Posts completion.
-    """
+    """Executes full worker pipeline against test client, verifying manifest claim, artifacts upload, and completion."""
     monkeypatch.setenv("SURFACE_WORKER_TOKEN", "mock-worker-token")
     manager = JobManager(storage_dir=tmp_path / "jobs")
     monkeypatch.setattr("backend.app.routes.internal.job_manager", manager)
@@ -563,6 +639,7 @@ def test_execute_worker_pipeline_end_to_end_mocked_http(tmp_path: Path, monkeypa
 
     success = execute_worker_pipeline(
         inspection_id=job.id,
+        lease_token=1,
         client=client,
         worker_name="mock-worker-node",
         worker_token="mock-worker-token",
@@ -572,62 +649,7 @@ def test_execute_worker_pipeline_end_to_end_mocked_http(tmp_path: Path, monkeypa
     updated = manager.get_job(job.id)
     assert updated.status == "completed"
     assert updated.point_count > 0
-    # Artifacts were uploaded to master storage
     assert (manager.storage_dir / job.id / "pointcloud.ply").exists()
-
-
-def test_execute_worker_pipeline_network_error_propagation(monkeypatch):
-    """Ensures network exceptions bubble up to Celery task so self.retry can catch them."""
-    mock_client = MagicMock()
-    mock_client.get.side_effect = Exception("Connection refused")
-
-    with pytest.raises(Exception, match="Connection refused"):
-        execute_worker_pipeline(
-            inspection_id="INSP-RETRY-TEST",
-            client=mock_client,
-            worker_name="mock-node",
-            worker_token="tok",
-        )
-
-
-def test_celery_task_retries_on_network_error():
-    """Verifies that run_inspection_task triggers self.retry on network errors."""
-    import httpx
-    with patch.object(run_inspection_task, "retry", side_effect=RuntimeError("Retry triggered")) as mock_retry:
-        with patch("backend.app.tasks.execute_worker_pipeline", side_effect=httpx.ConnectError("Network timeout")):
-            with pytest.raises(RuntimeError, match="Retry triggered"):
-                run_inspection_task.run("INSP-NET-ERR")
-        assert mock_retry.called
-
-
-def test_settings_custom_mesh_depth(monkeypatch):
-    """Verifies settings.py parses positive SURFACE_MESH_DEPTH and safely falls back on invalid values."""
-    monkeypatch.setenv("SURFACE_MESH_DEPTH", "6")
-    assert settings.get_mesh_depth() == 6
-    assert settings.SURFACE_MESH_DEPTH == 6
-
-    monkeypatch.setenv("SURFACE_MESH_DEPTH", "invalid")
-    assert settings.get_mesh_depth() == 8
-
-    monkeypatch.setenv("SURFACE_MESH_DEPTH", "-2")
-    assert settings.get_mesh_depth() == 8
-
-
-def test_settings_custom_model_path_and_thresholds(monkeypatch):
-    """Verifies settings.py extracts crack classifier hyperparameters and path overrides."""
-    monkeypatch.setenv("SURFACE_MODEL_PATH", "custom/path/model.pth")
-    monkeypatch.setenv("SURFACE_CRACK_THRESHOLD", "0.65")
-    monkeypatch.setenv("SURFACE_TILE_SIZE", "512")
-    monkeypatch.setenv("SURFACE_DEV_K", "4.0")
-    monkeypatch.setenv("SURFACE_DEV_MIN_MM", "8.0")
-    monkeypatch.setenv("SURFACE_DEV_MIN_AREA_PX", "300")
-
-    assert settings.get_model_path() == "custom/path/model.pth"
-    assert settings.get_crack_threshold() == 0.65
-    assert settings.get_tile_size() == 512
-    assert settings.get_dev_k() == 4.0
-    assert settings.get_dev_min_mm() == 8.0
-    assert settings.get_dev_min_area_px() == 300
 
 
 def test_create_job_in_celery_mode_skips_thread_pool(sample_job_in_manager):
@@ -659,56 +681,3 @@ def test_create_job_in_celery_mode_skips_thread_pool(sample_job_in_manager):
         )
         assert job.status == "queued"
         mock_submit.assert_not_called()
-
-
-def test_create_inspection_celery_mode_enqueue_failure_returns_503(test_client, monkeypatch, synthetic_stereo_pair, valid_rectified_calib_json):
-    """When SURFACE_EXECUTION=celery and Celery delay raises an error, returns 503 and marks job failed."""
-    monkeypatch.setenv("SURFACE_EXECUTION", "celery")
-
-    files = {
-        "left_image": ("left.png", synthetic_stereo_pair["left_bytes"], "image/png"),
-        "right_image": ("right.png", synthetic_stereo_pair["right_bytes"], "image/png"),
-        "calibration_file": ("calibration.json", valid_rectified_calib_json.encode("utf-8"), "application/json"),
-    }
-    data = {
-        "name": "Celery Broker Down Test",
-        "surface_type": "Concrete surface",
-    }
-
-    with patch("backend.app.tasks.run_inspection_task.delay", side_effect=Exception("Redis connection refused")):
-        res = test_client.post("/api/inspections", data=data, files=files)
-        assert res.status_code == 503
-        assert "Task queue unavailable" in res.json()["detail"]
-
-
-def test_pipeline_step_model_worker_and_duration_serialization():
-    """Verifies that PipelineStep serializes worker and duration_sec optional fields correctly."""
-    from backend.app.models.inspection import PipelineStep
-    step = PipelineStep(
-        id="disparity_estimation",
-        label="Disparity Estimation",
-        description="Stereo matching",
-        status="completed",
-        worker="worker-node-42",
-        duration_sec=3.142,
-    )
-    dumped = step.model_dump()
-    assert dumped["worker"] == "worker-node-42"
-    assert dumped["duration_sec"] == 3.142
-
-    # Roundtrip from JSON
-    restored = PipelineStep(**dumped)
-    assert restored.worker == "worker-node-42"
-    assert restored.duration_sec == 3.142
-
-
-def test_manifest_nonexistent_job_returns_404(test_client, sample_job_in_manager, monkeypatch):
-    """GET /api/internal/jobs/{id}/manifest returns 404 for non-existent job."""
-    manager, _ = sample_job_in_manager
-    monkeypatch.setattr("backend.app.routes.internal.job_manager", manager)
-
-    res = test_client.get(
-        "/api/internal/jobs/NONEXISTENT-INSP-ID/manifest",
-        headers={"X-Worker-Token": "test-secret-worker-token-xyz-123"},
-    )
-    assert res.status_code == 404

@@ -8,7 +8,7 @@ Exposes cluster worker status and task summary:
 Safely falls back to mode='local' and empty workers list when in local mode or when Redis is unreachable.
 """
 
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Set
 from fastapi import APIRouter
 
 from ..services.job_manager import job_manager
@@ -79,6 +79,7 @@ async def get_cluster_summary():
     """
     Returns counts of queued, processing, completed, and failed jobs,
     along with active worker assignments derived from job state.
+    Cross-references live worker status from Celery inspect ping.
     """
     mode = settings.get_execution_mode()
     jobs = job_manager.list_jobs()
@@ -88,15 +89,32 @@ async def get_cluster_summary():
     completed = sum(1 for j in jobs if j.status == "completed")
     failed = sum(1 for j in jobs if j.status == "failed")
 
+    online_workers: Set[str] = set()
+    inspect_succeeded = False
+    if mode == "celery":
+        try:
+            insp = celery_app.control.inspect(timeout=1.0)
+            if insp is not None:
+                pings = insp.ping()
+                if pings is not None:
+                    online_workers = set(pings.keys())
+                    inspect_succeeded = True
+        except Exception:
+            pass
+
     active_assignments: Dict[str, str] = {}
     for j in jobs:
         if j.status in ("queued", "processing"):
-            assigned_worker = None
-            for step in j.steps:
-                if step.worker:
-                    assigned_worker = step.worker
+            assigned_worker = j.assigned_worker
+            if not assigned_worker:
+                for step in j.steps:
+                    if step.worker:
+                        assigned_worker = step.worker
             if assigned_worker:
-                active_assignments[j.id] = assigned_worker
+                if mode == "celery" and inspect_succeeded and (assigned_worker not in online_workers):
+                    active_assignments[j.id] = f"{assigned_worker} (unresponsive)"
+                else:
+                    active_assignments[j.id] = assigned_worker
 
     return {
         "mode": mode,

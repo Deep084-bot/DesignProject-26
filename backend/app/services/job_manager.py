@@ -5,16 +5,21 @@ Authoritative specification: SURFACE_Master_Prompt.md Section 4.1 & 4.2.
 Manages inspection job lifecycles:
 - Isolated filesystem workspace per job (backend/storage/jobs/{inspection_id})
 - Safe file naming and artifact containment
+- Master-authoritative fencing leases and worker identity binding
+- Periodic heartbeats and monotonic elapsed time tracking
+- Crash-safe file-backed outbox for reliable dispatch
+- Two-phase atomic artifact staging and replacement
 - Thread-safe inspection state tracking and persistent JSON synchronization
 - Unified state updates via apply_step_update, apply_result, apply_failure
-  for both local thread-pool execution and distributed Celery workers
 """
 
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 import json
+import os
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 from ..models.inspection import (
@@ -32,6 +37,14 @@ from .. import settings
 BASE_STORAGE_DIR = Path(__file__).resolve().parent.parent.parent / "storage" / "jobs"
 
 
+class LeaseConflictError(Exception):
+    """Raised when an operation is attempted with an invalid, expired, or mismatched lease token."""
+    def __init__(self, message: str, status_code: int = 409):
+        super().__init__(message)
+        self.message = message
+        self.status_code = status_code
+
+
 class JobManager:
     def __init__(self, storage_dir: Path = BASE_STORAGE_DIR, max_workers: int = 2):
         self.storage_dir = storage_dir
@@ -39,6 +52,7 @@ class JobManager:
         self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="surface-worker")
         self._lock = threading.Lock()
         self._jobs: Dict[str, InspectionResponse] = {}
+        self._monotonic_heartbeats: Dict[str, float] = {}
         self._load_existing_jobs()
 
     def _load_existing_jobs(self):
@@ -58,12 +72,99 @@ class JobManager:
                             pass
 
     def _save_job_state(self, inspection: InspectionResponse):
-        """Persists current inspection model to its job directory."""
+        """Persists current inspection model to its job directory atomically."""
         job_dir = self.storage_dir / inspection.id
         job_dir.mkdir(parents=True, exist_ok=True)
         meta_file = job_dir / "inspection.json"
-        with open(meta_file, "w", encoding="utf-8") as f:
+        tmp_file = job_dir / f".inspection_{uuid.uuid4().hex}.tmp"
+        with open(tmp_file, "w", encoding="utf-8") as f:
             json.dump(inspection.model_dump(), f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_file, meta_file)
+
+    def _validate_lease_locked(
+        self,
+        inspection_id: str,
+        lease_token: int,
+        worker_name: Optional[str] = None,
+    ):
+        """
+        Validates ownership and fencing lease within self._lock.
+        Raises KeyError if inspection does not exist.
+        Raises LeaseConflictError if job is in a terminal state, lease token mismatches,
+        or worker identity mismatches.
+        """
+        if inspection_id not in self._jobs:
+            raise KeyError(f"Inspection '{inspection_id}' not found.")
+        job = self._jobs[inspection_id]
+        if job.status in ("completed", "failed"):
+            raise LeaseConflictError(f"Job '{inspection_id}' is already in terminal state '{job.status}'.")
+        if job.lease_token != lease_token:
+            raise LeaseConflictError(
+                f"Fencing lease token mismatch: job lease is {job.lease_token}, but request provided {lease_token}."
+            )
+        if worker_name and job.assigned_worker and job.assigned_worker != worker_name:
+            raise LeaseConflictError(
+                f"Worker identity mismatch: job '{inspection_id}' is bound to worker '{job.assigned_worker}', "
+                f"but request came from '{worker_name}'."
+            )
+
+    def claim_manifest(
+        self,
+        inspection_id: str,
+        lease_token: int,
+        worker_name: str,
+    ) -> InspectionResponse:
+        """
+        Claims a job manifest and binds worker identity to the current lease token.
+        Raises KeyError if inspection does not exist.
+        Raises LeaseConflictError on lease or worker mismatch.
+        """
+        with self._lock:
+            self._validate_lease_locked(inspection_id, lease_token, worker_name)
+            job = self._jobs[inspection_id]
+            job.assigned_worker = worker_name
+            now_epoch = time.time()
+            job.last_heartbeat_at = now_epoch
+            self._monotonic_heartbeats[inspection_id] = time.monotonic()
+            if job.status == "queued":
+                job.status = "processing"
+            self._save_job_state(job)
+            return job
+
+    def apply_heartbeat(
+        self,
+        inspection_id: str,
+        lease_token: int,
+        worker_name: str,
+    ) -> bool:
+        """
+        Records a worker heartbeat for an active lease.
+        Raises KeyError or LeaseConflictError on validation failure.
+        """
+        with self._lock:
+            self._validate_lease_locked(inspection_id, lease_token, worker_name)
+            job = self._jobs[inspection_id]
+            job.last_heartbeat_at = time.time()
+            self._monotonic_heartbeats[inspection_id] = time.monotonic()
+            self._save_job_state(job)
+            return True
+
+    def get_heartbeat_age(self, inspection_id: str) -> Optional[float]:
+        """
+        Returns elapsed seconds since the last heartbeat for this inspection.
+        Uses monotonic time if recorded in memory; falls back to wall-clock time
+        relative to last_heartbeat_at for cross-process / post-restart continuity.
+        Returns None if no heartbeat was ever recorded.
+        """
+        with self._lock:
+            if inspection_id in self._monotonic_heartbeats:
+                return round(time.monotonic() - self._monotonic_heartbeats[inspection_id], 3)
+            job = self._jobs.get(inspection_id)
+            if job and job.last_heartbeat_at is not None:
+                return round(max(0.0, time.time() - job.last_heartbeat_at), 3)
+            return None
 
     def apply_step_update(
         self,
@@ -74,18 +175,25 @@ class JobManager:
         worker: Optional[str] = None,
         duration_sec: Optional[float] = None,
         message: Optional[str] = None,
+        lease_token: Optional[int] = None,
     ) -> bool:
         """
         Thread-safe application of a stage progress update.
-        Ignores late updates if job is already in a terminal state (completed or failed).
-        Returns True if updated, False if job not found or update ignored.
+        If lease_token is provided, validates fencing lease inside self._lock.
+        Ignores late updates if job is already in terminal state when lease_token is None.
+        Raises LeaseConflictError on fencing mismatch if lease_token is specified.
+        Returns True if updated, False if ignored or not found.
         """
         with self._lock:
             if inspection_id not in self._jobs:
                 return False
             job = self._jobs[inspection_id]
-            if job.status in ("completed", "failed"):
-                return False
+
+            if lease_token is not None:
+                self._validate_lease_locked(inspection_id, lease_token, worker)
+            else:
+                if job.status in ("completed", "failed"):
+                    return False
 
             if job.status == "queued" and status in ("active", "processing"):
                 job.status = "processing"
@@ -101,6 +209,10 @@ class JobManager:
 
             if status == "failed" and message:
                 job.failure_message = message
+
+            # Refresh heartbeat timestamp on step activity
+            job.last_heartbeat_at = time.time()
+            self._monotonic_heartbeats[inspection_id] = time.monotonic()
 
             self._save_job_state(job)
             return True
@@ -118,18 +230,25 @@ class JobManager:
         classifier_error: Optional[str] = None,
         duration_sec: float = 0.0,
         worker: Optional[str] = None,
+        lease_token: Optional[int] = None,
     ) -> bool:
         """
         Thread-safe application of successful inspection results.
-        Ignores duplicate completion if job is already in a terminal state.
-        Returns True if applied, False if job not found or ignored.
+        If lease_token is provided, validates fencing lease.
+        Duplicate completion on an already completed job returns True idempotently.
         """
         with self._lock:
             if inspection_id not in self._jobs:
                 return False
             job = self._jobs[inspection_id]
-            if job.status in ("completed", "failed"):
-                return False
+
+            if lease_token is not None:
+                if job.status == "completed":
+                    return True
+                self._validate_lease_locked(inspection_id, lease_token, worker)
+            else:
+                if job.status in ("completed", "failed"):
+                    return False
 
             job.status = "completed"
             job.current_step_index = len(job.steps) - 1
@@ -162,7 +281,6 @@ class JobManager:
                     finding_obj = Finding(**item)
                 else:
                     finding_obj = item
-                # Normalize crop URL inspection ID
                 if finding_obj.image_crop_url and "/api/inspections/" in finding_obj.image_crop_url:
                     parts = finding_obj.image_crop_url.split("/")
                     if len(parts) >= 5 and parts[2] == "inspections":
@@ -188,18 +306,25 @@ class JobManager:
         message: str,
         failed_stage_index: Optional[int] = None,
         worker: Optional[str] = None,
+        lease_token: Optional[int] = None,
     ) -> bool:
         """
         Thread-safe application of a job failure.
-        Ignores failure update if job is already in a terminal state.
-        Returns True if applied, False if job not found or ignored.
+        If lease_token is provided, validates fencing lease.
+        Ignores failure update if job is already in terminal state.
         """
         with self._lock:
             if inspection_id not in self._jobs:
                 return False
             job = self._jobs[inspection_id]
-            if job.status in ("completed", "failed"):
-                return False
+
+            if lease_token is not None:
+                if job.status in ("completed", "failed"):
+                    return False
+                self._validate_lease_locked(inspection_id, lease_token, worker)
+            else:
+                if job.status in ("completed", "failed"):
+                    return False
 
             job.status = "failed"
             job.failure_message = message
@@ -210,6 +335,179 @@ class JobManager:
 
             self._save_job_state(job)
             return True
+
+    def commit_artifact(
+        self,
+        inspection_id: str,
+        lease_token: int,
+        worker_name: str,
+        artifact_name: str,
+        staging_path: Path,
+    ) -> bool:
+        """
+        Validates fencing lease within self._lock and atomically commits
+        a staged artifact file to the job directory via os.replace.
+        Cleans up staging_path on validation failure.
+        """
+        with self._lock:
+            try:
+                self._validate_lease_locked(inspection_id, lease_token, worker_name)
+            except Exception:
+                staging_path.unlink(missing_ok=True)
+                raise
+
+            job = self._jobs[inspection_id]
+            target_path = self.storage_dir / inspection_id / artifact_name
+            os.replace(staging_path, target_path)
+
+            job.last_heartbeat_at = time.time()
+            self._monotonic_heartbeats[inspection_id] = time.monotonic()
+            return True
+
+    def write_outbox_intent(self, inspection_id: str, lease_token: int) -> Path:
+        """Writes crash-safe dispatch intent file using atomic staging and os.replace."""
+        outbox_dir = self.storage_dir / inspection_id / "outbox"
+        outbox_dir.mkdir(parents=True, exist_ok=True)
+        final_file = outbox_dir / f"dispatch_{lease_token}.json"
+        tmp_file = outbox_dir / f".dispatch_{lease_token}_{uuid.uuid4().hex}.tmp"
+
+        payload = {
+            "inspection_id": inspection_id,
+            "lease_token": lease_token,
+            "created_at": time.time(),
+            "state": "pending",
+        }
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+
+        os.replace(tmp_file, final_file)
+        return final_file
+
+    def mark_outbox_published(self, inspection_id: str, lease_token: int):
+        """Atomically updates dispatch record state to 'published'."""
+        outbox_dir = self.storage_dir / inspection_id / "outbox"
+        final_file = outbox_dir / f"dispatch_{lease_token}.json"
+        if not final_file.exists():
+            return
+
+        tmp_file = outbox_dir / f".dispatch_{lease_token}_{uuid.uuid4().hex}.tmp"
+        payload = {
+            "inspection_id": inspection_id,
+            "lease_token": lease_token,
+            "created_at": time.time(),
+            "state": "published",
+        }
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+
+        os.replace(tmp_file, final_file)
+
+    def cleanup_outbox(self, inspection_id: str, lease_token: int):
+        """Removes the outbox file once publication has succeeded."""
+        outbox_dir = self.storage_dir / inspection_id / "outbox"
+        final_file = outbox_dir / f"dispatch_{lease_token}.json"
+        final_file.unlink(missing_ok=True)
+
+    def reconcile_outbox_on_startup(self) -> int:
+        """
+        Scans storage for uncommitted/pending outbox records on master startup,
+        re-publishing pending tasks and cleaning up completed or orphaned temp files.
+        Returns the number of re-published jobs.
+        """
+        republished = 0
+        if not self.storage_dir.exists():
+            return republished
+
+        for job_dir in self.storage_dir.iterdir():
+            if not job_dir.is_dir():
+                continue
+            outbox_dir = job_dir / "outbox"
+            if not outbox_dir.exists() or not outbox_dir.is_dir():
+                continue
+
+            for item in list(outbox_dir.iterdir()):
+                if item.name.startswith(".dispatch_") and item.name.endswith(".tmp"):
+                    item.unlink(missing_ok=True)
+                    continue
+
+                if item.name.startswith("dispatch_") and item.name.endswith(".json"):
+                    try:
+                        with open(item, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        state = data.get("state")
+                        insp_id = data.get("inspection_id")
+                        lease = data.get("lease_token", 1)
+
+                        if state == "published":
+                            item.unlink(missing_ok=True)
+                        elif state == "pending":
+                            with self._lock:
+                                job = self._jobs.get(insp_id)
+                                should_publish = (
+                                    job is not None
+                                    and job.status in ("queued", "processing")
+                                    and job.lease_token == lease
+                                )
+
+                            if should_publish and settings.get_execution_mode() == "celery":
+                                try:
+                                    from ..tasks import run_inspection_task
+                                    run_inspection_task.delay(insp_id, lease)
+                                    republished += 1
+                                    self.mark_outbox_published(insp_id, lease)
+                                    item.unlink(missing_ok=True)
+                                except Exception:
+                                    pass
+                            else:
+                                item.unlink(missing_ok=True)
+                    except Exception:
+                        item.unlink(missing_ok=True)
+        return republished
+
+    def reassign_orphaned_job(
+        self,
+        inspection_id: str,
+        expected_lease_token: int,
+        reason: str = "",
+    ) -> Optional[int]:
+        """
+        Performs atomic CAS reassignment for an orphaned or dead-worker job.
+        Increments lease_token by 1, clears assigned_worker, resets steps to waiting,
+        writes crash-safe outbox intent, and returns the new lease_token.
+        Returns None if job not found, in terminal state, or expected_lease_token mismatched.
+        """
+        with self._lock:
+            if inspection_id not in self._jobs:
+                return None
+            job = self._jobs[inspection_id]
+            if job.status in ("completed", "failed"):
+                return None
+            if job.lease_token != expected_lease_token:
+                # Concurrent bump or mismatch
+                return None
+
+            new_lease = expected_lease_token + 1
+            job.lease_token = new_lease
+            job.assigned_worker = None
+            job.last_heartbeat_at = None
+            job.recovery_pending = False
+            self._monotonic_heartbeats.pop(inspection_id, None)
+
+            # Reset pipeline steps back to initial state
+            for s in job.steps:
+                s.status = "waiting"
+                s.duration_sec = None
+                s.worker = None
+            job.current_step_index = 0
+            job.status = "queued"
+
+            self._save_job_state(job)
+            self.write_outbox_intent(inspection_id, new_lease)
+            return new_lease
 
     def create_job(
         self,

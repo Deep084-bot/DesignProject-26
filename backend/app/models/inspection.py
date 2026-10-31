@@ -107,6 +107,10 @@ class InspectionResponse(BaseModel):
     findings: List[Finding] = Field(default_factory=list)
     failure_message: Optional[str] = None
     is_demo_mode: bool = False
+    lease_token: int = 1
+    assigned_worker: Optional[str] = None
+    last_heartbeat_at: Optional[float] = None
+    recovery_pending: bool = False
 
     @classmethod
     def create_initial(
@@ -141,4 +145,8 @@ class InspectionResponse(BaseModel):
             right_image=right_meta,
             calibration=calib_summary,
             is_demo_mode=False,
+            lease_token=1,
+            assigned_worker=None,
+            last_heartbeat_at=None,
+            recovery_pending=False,
         )
