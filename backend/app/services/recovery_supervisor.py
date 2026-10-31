@@ -53,6 +53,9 @@ class RecoverySupervisor:
             logger.warning(f"Recovery supervisor: Redis broker error ({exc}). Deferring recovery.")
             return
 
+        # Reconcile any deferred outbox intents now that broker is verified online
+        self.job_manager.reconcile_outbox_on_startup()
+
         jobs = self.job_manager.list_jobs()
         lease_timeout = settings.get_lease_timeout()
         grace_threshold = settings.get_offline_grace_period()
@@ -153,3 +156,4 @@ class RecoverySupervisor:
 
 # Global singleton instance
 recovery_supervisor = RecoverySupervisor(job_manager)
+

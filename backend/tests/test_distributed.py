@@ -531,6 +531,174 @@ def test_master_crash_after_publication_before_cleanup(sample_job_in_manager, mo
         assert not (manager.storage_dir / job.id / "outbox" / "dispatch_1.json").exists()
 
 
+def test_crash_after_durable_intent_before_inspection_state_persistence_reconciles(sample_job_in_manager, monkeypatch):
+    """
+    PRIMARY REGRESSION TEST:
+    Simulates a hard master crash immediately after writing the durable recovery intent
+    (dispatch_2.json with previous_lease=1, intended_lease=2), but BEFORE inspection.json
+    was updated (inspection remains at lease 1 on disk).
+
+    Verifies that on master reboot:
+    1. Startup reconciliation detects the durable intent.
+    2. Safely advances the inspection lease from 1 to 2.
+    3. Re-dispatches the Celery task with lease 2.
+    4. Marks published and removes the outbox intent.
+    5. Allows a replacement worker to claim manifest under lease 2.
+    6. Leaves no stuck/unrecoverable queued state.
+    """
+    manager, job = sample_job_in_manager
+    monkeypatch.setenv("SURFACE_EXECUTION", "celery")
+
+    # Bind worker to generation 1
+    manager.claim_manifest(job.id, lease_token=1, worker_name="worker-dead")
+    assert manager.get_job(job.id).lease_token == 1
+    assert manager.get_job(job.id).assigned_worker == "worker-dead"
+
+    # Write-ahead recovery intent exists on disk (as written by write_outbox_intent in Step 1 of reassignment)
+    intent_file = manager.write_outbox_intent(
+        inspection_id=job.id,
+        lease_token=2,
+        previous_lease=1,
+        reason="Worker worker-dead lost",
+    )
+    assert intent_file.exists()
+
+    # Simulate hard crash before inspection.json update:
+    # inspection.json on disk is still at lease 1 with worker-dead.
+    job_on_disk_file = manager.storage_dir / job.id / "inspection.json"
+    with open(job_on_disk_file, "r") as f:
+        disk_data = json.load(f)
+    assert disk_data["lease_token"] == 1
+    assert disk_data["assigned_worker"] == "worker-dead"
+
+    # Simulate Master Restart: Instantiate a completely new JobManager from disk
+    new_manager = JobManager(storage_dir=manager.storage_dir)
+    loaded_job = new_manager.get_job(job.id)
+    assert loaded_job is not None
+    assert loaded_job.lease_token == 1  # Still at previous lease before reconciliation
+
+    # Run startup reconciliation
+    with patch("backend.app.tasks.run_inspection_task.delay") as mock_delay:
+        republished = new_manager.reconcile_outbox_on_startup()
+        assert republished == 1
+        mock_delay.assert_called_once_with(job.id, 2)
+
+    # Verify inspection reached lease 2 and queued state
+    updated_job = new_manager.get_job(job.id)
+    assert updated_job.lease_token == 2
+    assert updated_job.assigned_worker is None
+    assert updated_job.status == "queued"
+    assert not intent_file.exists()
+
+    # Verify persistent state on disk matches
+    with open(job_on_disk_file, "r") as f:
+        new_disk_data = json.load(f)
+    assert new_disk_data["lease_token"] == 2
+    assert new_disk_data["assigned_worker"] is None
+    assert new_disk_data["status"] == "queued"
+
+    # Verify replacement worker can successfully claim the job under lease 2
+    claimed_job = new_manager.claim_manifest(job.id, lease_token=2, worker_name="worker-survivor")
+    assert claimed_job.assigned_worker == "worker-survivor"
+    assert claimed_job.status == "processing"
+
+
+def test_crash_after_inspection_state_persistence_before_broker_publication_reconciles(sample_job_in_manager, monkeypatch):
+    """
+    Simulates crash after both durable intent and inspection.json are persisted at lease 2,
+    but before broker publication.
+    On reboot, reconciliation detects state='pending' with job.lease_token == intended_lease,
+    and reliably dispatches the task.
+    """
+    manager, job = sample_job_in_manager
+    monkeypatch.setenv("SURFACE_EXECUTION", "celery")
+
+    # Complete the CAS reassignment (both intent and inspection state persisted)
+    new_lease = manager.reassign_orphaned_job(job.id, expected_lease_token=1, reason="Worker loss")
+    assert new_lease == 2
+    assert (manager.storage_dir / job.id / "outbox" / "dispatch_2.json").exists()
+
+    # Simulate Master Restart
+    new_manager = JobManager(storage_dir=manager.storage_dir)
+    with patch("backend.app.tasks.run_inspection_task.delay") as mock_delay:
+        republished = new_manager.reconcile_outbox_on_startup()
+        assert republished == 1
+        mock_delay.assert_called_once_with(job.id, 2)
+        assert not (manager.storage_dir / job.id / "outbox" / "dispatch_2.json").exists()
+
+
+def test_crash_after_broker_publication_before_marking_published_idempotent(sample_job_in_manager, monkeypatch):
+    """
+    Crash after publication leaves pending record. On reboot, duplicate publication is issued,
+    and subsequent manifest claim by duplicate worker is rejected with 409 Conflict.
+    """
+    manager, job = sample_job_in_manager
+    monkeypatch.setenv("SURFACE_EXECUTION", "celery")
+
+    manager.reassign_orphaned_job(job.id, expected_lease_token=1)
+    # Intent remains 'pending' (simulating crash before mark_outbox_published)
+
+    new_manager = JobManager(storage_dir=manager.storage_dir)
+    with patch("backend.app.tasks.run_inspection_task.delay") as mock_delay:
+        republished = new_manager.reconcile_outbox_on_startup()
+        assert republished == 1
+        assert mock_delay.called
+
+    # Worker 1 claims manifest under lease 2
+    new_manager.claim_manifest(job.id, lease_token=2, worker_name="worker-1")
+
+    # Worker 2 attempting to claim duplicate task with different worker gets 409 Conflict
+    with pytest.raises(LeaseConflictError) as exc_info:
+        new_manager.claim_manifest(job.id, lease_token=2, worker_name="worker-2")
+    assert exc_info.value.status_code == 409
+
+
+def test_stale_intent_does_not_overwrite_newer_lease(sample_job_in_manager, monkeypatch):
+    """
+    A stale outbox intent for generation 2 must not overwrite or reassign
+    an inspection that has already advanced to generation 3.
+    """
+    manager, job = sample_job_in_manager
+    monkeypatch.setenv("SURFACE_EXECUTION", "celery")
+
+    # Advance job to lease 3
+    manager.reassign_orphaned_job(job.id, expected_lease_token=1)
+    manager.cleanup_outbox(job.id, 2)
+    manager.reassign_orphaned_job(job.id, expected_lease_token=2)
+    manager.cleanup_outbox(job.id, 3)
+    assert manager.get_job(job.id).lease_token == 3
+
+    # Manually drop an old intent for lease 2 into outbox
+    stale_file = manager.write_outbox_intent(job.id, lease_token=2, previous_lease=1)
+    assert stale_file.exists()
+
+    with patch("backend.app.tasks.run_inspection_task.delay") as mock_delay:
+        republished = manager.reconcile_outbox_on_startup()
+        assert republished == 0
+        mock_delay.assert_not_called()
+        assert not stale_file.exists()
+        # Job remains untouched at generation 3
+        assert manager.get_job(job.id).lease_token == 3
+
+
+def test_redis_unavailable_retains_durable_intent(sample_job_in_manager, monkeypatch):
+    """
+    When Redis/broker is down during startup reconciliation, the durable intent
+    is retained on disk in 'pending' state and not unlinked.
+    """
+    manager, job = sample_job_in_manager
+    monkeypatch.setenv("SURFACE_EXECUTION", "celery")
+
+    intent_file = manager.write_outbox_intent(job.id, lease_token=1)
+    assert intent_file.exists()
+
+    with patch("backend.app.tasks.run_inspection_task.delay", side_effect=Exception("Redis connection refused")):
+        republished = manager.reconcile_outbox_on_startup()
+        assert republished == 0
+        # Intent file MUST remain on disk to be retried
+        assert intent_file.exists()
+
+
 # ============================================================================
 # 8. Clean Worker Abort on 409 (No Retries, No Late Failures, Tempdir Cleanup)
 # ============================================================================

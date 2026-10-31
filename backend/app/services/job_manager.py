@@ -82,6 +82,14 @@ class JobManager:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_file, meta_file)
+        try:
+            dir_fd = os.open(str(job_dir), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except Exception:
+            pass
 
     def _validate_lease_locked(
         self,
@@ -364,18 +372,32 @@ class JobManager:
             self._monotonic_heartbeats[inspection_id] = time.monotonic()
             return True
 
-    def write_outbox_intent(self, inspection_id: str, lease_token: int) -> Path:
-        """Writes crash-safe dispatch intent file using atomic staging and os.replace."""
+    def write_outbox_intent(
+        self,
+        inspection_id: str,
+        lease_token: int,
+        previous_lease: Optional[int] = None,
+        reason: str = "",
+    ) -> Path:
+        """
+        Writes crash-safe write-ahead dispatch intent file using atomic staging, fsync, and os.replace.
+        Guarantees that intent exists durably before lease transition is committed.
+        """
         outbox_dir = self.storage_dir / inspection_id / "outbox"
         outbox_dir.mkdir(parents=True, exist_ok=True)
         final_file = outbox_dir / f"dispatch_{lease_token}.json"
-        tmp_file = outbox_dir / f".dispatch_{lease_token}_{uuid.uuid4().hex}.tmp"
+        dispatch_id = uuid.uuid4().hex
+        tmp_file = outbox_dir / f".dispatch_{lease_token}_{dispatch_id}.tmp"
 
+        prev_lease = previous_lease if previous_lease is not None else max(0, lease_token - 1)
         payload = {
             "inspection_id": inspection_id,
-            "lease_token": lease_token,
+            "dispatch_id": dispatch_id,
+            "previous_lease": prev_lease,
+            "intended_lease": lease_token,
             "created_at": time.time(),
             "state": "pending",
+            "reason": reason,
         }
         with open(tmp_file, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
@@ -383,6 +405,14 @@ class JobManager:
             os.fsync(f.fileno())
 
         os.replace(tmp_file, final_file)
+        try:
+            dir_fd = os.open(str(outbox_dir), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except Exception:
+            pass
         return final_file
 
     def mark_outbox_published(self, inspection_id: str, lease_token: int):
@@ -392,12 +422,23 @@ class JobManager:
         if not final_file.exists():
             return
 
+        existing_data = {}
+        try:
+            with open(final_file, "r", encoding="utf-8") as f:
+                existing_data = json.load(f)
+        except Exception:
+            pass
+
         tmp_file = outbox_dir / f".dispatch_{lease_token}_{uuid.uuid4().hex}.tmp"
         payload = {
             "inspection_id": inspection_id,
-            "lease_token": lease_token,
-            "created_at": time.time(),
+            "dispatch_id": existing_data.get("dispatch_id", uuid.uuid4().hex),
+            "previous_lease": existing_data.get("previous_lease", max(0, lease_token - 1)),
+            "intended_lease": existing_data.get("intended_lease", lease_token),
+            "created_at": existing_data.get("created_at", time.time()),
             "state": "published",
+            "published_at": time.time(),
+            "reason": existing_data.get("reason", ""),
         }
         with open(tmp_file, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
@@ -405,6 +446,14 @@ class JobManager:
             os.fsync(f.fileno())
 
         os.replace(tmp_file, final_file)
+        try:
+            dir_fd = os.open(str(outbox_dir), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except Exception:
+            pass
 
     def cleanup_outbox(self, inspection_id: str, lease_token: int):
         """Removes the outbox file once publication has succeeded."""
@@ -414,8 +463,15 @@ class JobManager:
 
     def reconcile_outbox_on_startup(self) -> int:
         """
-        Scans storage for uncommitted/pending outbox records on master startup,
-        re-publishing pending tasks and cleaning up completed or orphaned temp files.
+        Scans storage for uncommitted/pending outbox records on master startup or supervisor tick.
+        Handles:
+        A. No intent: no recovery action.
+        B. Durable intent exists, inspection still has previous lease: completes lease transition and dispatches.
+        C. Durable intent exists, inspection already has intended lease: publishes or cleans up idempotently.
+        D. Intent exists but inspection has newer lease: cleans up stale intent safely.
+        E. Crash after broker publication: republishes (tolerates at-least-once duplicate delivery).
+        F. Crash after marking published: cleans up file without duplicate publication.
+        G. Redis unavailable: retains intent file and defers publication.
         Returns the number of re-published jobs.
         """
         republished = 0
@@ -430,6 +486,7 @@ class JobManager:
                 continue
 
             for item in list(outbox_dir.iterdir()):
+                # Clean up dangling temporary files
                 if item.name.startswith(".dispatch_") and item.name.endswith(".tmp"):
                     item.unlink(missing_ok=True)
                     continue
@@ -440,30 +497,60 @@ class JobManager:
                             data = json.load(f)
                         state = data.get("state")
                         insp_id = data.get("inspection_id")
-                        lease = data.get("lease_token", 1)
+                        intended_lease = data.get("intended_lease", data.get("lease_token", 1))
+                        previous_lease = data.get("previous_lease", max(0, intended_lease - 1))
 
                         if state == "published":
+                            # Requirement F: already published before crash, clean up without republishing
                             item.unlink(missing_ok=True)
-                        elif state == "pending":
-                            with self._lock:
-                                job = self._jobs.get(insp_id)
-                                should_publish = (
-                                    job is not None
-                                    and job.status in ("queued", "processing")
-                                    and job.lease_token == lease
-                                )
+                            continue
 
-                            if should_publish and settings.get_execution_mode() == "celery":
-                                try:
-                                    from ..tasks import run_inspection_task
-                                    run_inspection_task.delay(insp_id, lease)
-                                    republished += 1
-                                    self.mark_outbox_published(insp_id, lease)
-                                    item.unlink(missing_ok=True)
-                                except Exception:
-                                    pass
-                            else:
+                        # state == "pending"
+                        with self._lock:
+                            job = self._jobs.get(insp_id)
+                            if job is None or job.status in ("completed", "failed"):
+                                # Job does not exist or already finished; clean up stale intent
                                 item.unlink(missing_ok=True)
+                                continue
+
+                            # Requirement D: Stale intent where inspection already advanced to a newer lease
+                            if job.lease_token > intended_lease:
+                                item.unlink(missing_ok=True)
+                                continue
+
+                            # Requirement B: Interrupted transition where inspection still has previous lease
+                            if job.lease_token == previous_lease:
+                                job.lease_token = intended_lease
+                                job.assigned_worker = None
+                                job.last_heartbeat_at = None
+                                job.recovery_pending = False
+                                self._monotonic_heartbeats.pop(insp_id, None)
+                                for s in job.steps:
+                                    s.status = "waiting"
+                                    s.duration_sec = None
+                                    s.worker = None
+                                job.current_step_index = 0
+                                job.status = "queued"
+                                self._save_job_state(job)
+
+                            # Requirement C: Job is at intended lease and queued/processing
+                            should_publish = (
+                                job.status in ("queued", "processing")
+                                and job.lease_token == intended_lease
+                            )
+
+                        if should_publish and settings.get_execution_mode() == "celery":
+                            try:
+                                from ..tasks import run_inspection_task
+                                run_inspection_task.delay(insp_id, intended_lease)
+                                republished += 1
+                                self.mark_outbox_published(insp_id, intended_lease)
+                                self.cleanup_outbox(insp_id, intended_lease)
+                            except Exception:
+                                # Requirement G: Redis unavailable; retain intent file and defer publication
+                                pass
+                        elif not should_publish:
+                            item.unlink(missing_ok=True)
                     except Exception:
                         item.unlink(missing_ok=True)
         return republished
@@ -475,10 +562,11 @@ class JobManager:
         reason: str = "",
     ) -> Optional[int]:
         """
-        Performs atomic CAS reassignment for an orphaned or dead-worker job.
-        Increments lease_token by 1, clears assigned_worker, resets steps to waiting,
-        writes crash-safe outbox intent, and returns the new lease_token.
-        Returns None if job not found, in terminal state, or expected_lease_token mismatched.
+        Performs atomic CAS reassignment for an orphaned or dead-worker job using write-ahead recovery intent.
+        1. Under lock, verifies expected_lease_token and recovery eligibility.
+        2. Durably writes write-ahead recovery dispatch intent FIRST (dispatch_{new_lease}.json).
+        3. Updates in-memory state and atomically persists inspection.json with the new lease generation.
+        Returns the new lease_token, or None on CAS mismatch or terminal state.
         """
         with self._lock:
             if inspection_id not in self._jobs:
@@ -491,6 +579,16 @@ class JobManager:
                 return None
 
             new_lease = expected_lease_token + 1
+
+            # 1. Write-Ahead Recovery Intent: durably write dispatch intent BEFORE committing lease in inspection.json
+            self.write_outbox_intent(
+                inspection_id=inspection_id,
+                lease_token=new_lease,
+                previous_lease=expected_lease_token,
+                reason=reason,
+            )
+
+            # 2. Update job state and persist inspection.json
             job.lease_token = new_lease
             job.assigned_worker = None
             job.last_heartbeat_at = None
@@ -506,7 +604,6 @@ class JobManager:
             job.status = "queued"
 
             self._save_job_state(job)
-            self.write_outbox_intent(inspection_id, new_lease)
             return new_lease
 
     def create_job(
