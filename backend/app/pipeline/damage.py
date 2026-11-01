@@ -194,59 +194,55 @@ class DamageDetectionResult:
     stats: Dict[str, Any] = field(default_factory=dict)
 
 
-def generate_tiles(
-    image_bgr: np.ndarray,
+def generate_tile_definitions(
+    image_shape: Tuple[int, int],
     deviation_regions: List[Any],
     tile_size: int = 256,
     stride: int = 256,
 ) -> List[Dict[str, Any]]:
     """
-    Generates regular grid tiles across the entire image and focused extra tiles
-    around each deviation anomaly region.
+    Generates deterministic tile coordinates and bounding boxes across the image
+    (regular grid) and focused extra tiles around each deviation anomaly region.
 
-    Tiles overlapping boundaries are reflect-padded to preserve exact tile_size.
-    Bounding boxes are retained in original rectified-left pixel coordinates.
+    Returns lightweight, JSON-serializable tile definition metadata without
+    storing raw image numpy arrays.
     """
-    H, W = image_bgr.shape[:2]
-    tiles: List[Dict[str, Any]] = []
+    H, W = image_shape[:2]
+    tile_defs: List[Dict[str, Any]] = []
 
-    # If image is smaller than tile_size, scale up temporarily or pad
+    # If image is smaller than tile_size, mark as single small-image tile
     if H < tile_size or W < tile_size:
-        scale = max(tile_size / max(1, H), tile_size / max(1, W))
-        pad_h = max(0, tile_size - H)
-        pad_w = max(0, tile_size - W)
-        padded = cv2.copyMakeBorder(image_bgr, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT_101)
-        tile_crop = padded[:tile_size, :tile_size]
-        tiles.append({
-            "tile_bgr": tile_crop,
+        tile_defs.append({
+            "tile_index": 0,
             "bbox": {"x": 0, "y": 0, "width": W, "height": H},
+            "crop_coords": [0, 0, W, H],
             "source": "grid",
             "region": None,
+            "is_small_image": True,
         })
-        return tiles
+        return tile_defs
+
+    tile_counter = 0
 
     # 1. Regular Grid Tiles
     ny = int(np.ceil(H / stride))
     nx = int(np.ceil(W / stride))
-    target_h = (ny - 1) * stride + tile_size
-    target_w = (nx - 1) * stride + tile_size
-    pad_bottom = max(0, target_h - H)
-    pad_right = max(0, target_w - W)
-    padded_grid = cv2.copyMakeBorder(image_bgr, 0, pad_bottom, 0, pad_right, cv2.BORDER_REFLECT_101)
 
     for iy in range(ny):
         y0 = iy * stride
         for ix in range(nx):
             x0 = ix * stride
-            crop = padded_grid[y0 : y0 + tile_size, x0 : x0 + tile_size]
             actual_w = min(tile_size, W - x0)
             actual_h = min(tile_size, H - y0)
-            tiles.append({
-                "tile_bgr": crop,
+            tile_defs.append({
+                "tile_index": tile_counter,
                 "bbox": {"x": x0, "y": y0, "width": actual_w, "height": actual_h},
+                "crop_coords": [y0, x0, tile_size, tile_size],
                 "source": "grid",
                 "region": None,
+                "is_small_image": False,
             })
+            tile_counter += 1
 
     # 2. Extra Tiles Centered Around Deviation Regions
     for reg in deviation_regions:
@@ -264,13 +260,15 @@ def generate_tiles(
             y0 = int(round(cy - tile_size / 2.0))
             x0 = max(0, min(W - tile_size, x0))
             y0 = max(0, min(H - tile_size, y0))
-            crop = image_bgr[y0 : y0 + tile_size, x0 : x0 + tile_size]
-            tiles.append({
-                "tile_bgr": crop,
+            tile_defs.append({
+                "tile_index": tile_counter,
                 "bbox": {"x": x0, "y": y0, "width": tile_size, "height": tile_size},
+                "crop_coords": [y0, x0, tile_size, tile_size],
                 "source": "region",
                 "region": reg,
+                "is_small_image": False,
             })
+            tile_counter += 1
         else:
             # Multi-tile coverage across large region with 50% overlap
             step = tile_size // 2
@@ -278,14 +276,79 @@ def generate_tiles(
                 for tx in range(rx, rx + rw, step):
                     x0 = max(0, min(W - tile_size, tx))
                     y0 = max(0, min(H - tile_size, ty))
-                    crop = image_bgr[y0 : y0 + tile_size, x0 : x0 + tile_size]
-                    tiles.append({
-                        "tile_bgr": crop,
+                    tile_defs.append({
+                        "tile_index": tile_counter,
                         "bbox": {"x": x0, "y": y0, "width": tile_size, "height": tile_size},
+                        "crop_coords": [y0, x0, tile_size, tile_size],
                         "source": "region",
                         "region": reg,
+                        "is_small_image": False,
                     })
+                    tile_counter += 1
 
+    return tile_defs
+
+
+def extract_tile_crop(
+    image_bgr: np.ndarray,
+    tile_def: Dict[str, Any],
+    tile_size: int = 256,
+) -> np.ndarray:
+    """
+    Extracts a 256x256 BGR tile crop from the full rectified image according to its
+    tile definition, applying border reflection padding if required.
+    """
+    H, W = image_bgr.shape[:2]
+
+    if tile_def.get("is_small_image") or H < tile_size or W < tile_size:
+        pad_h = max(0, tile_size - H)
+        pad_w = max(0, tile_size - W)
+        padded = cv2.copyMakeBorder(image_bgr, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT_101)
+        return padded[:tile_size, :tile_size]
+
+    y0 = int(tile_def["crop_coords"][0])
+    x0 = int(tile_def["crop_coords"][1])
+
+    pad_bottom = max(0, (y0 + tile_size) - H)
+    pad_right = max(0, (x0 + tile_size) - W)
+    pad_top = max(0, -y0)
+    pad_left = max(0, -x0)
+
+    if pad_top > 0 or pad_bottom > 0 or pad_left > 0 or pad_right > 0:
+        padded = cv2.copyMakeBorder(image_bgr, pad_top, pad_bottom, pad_left, pad_right, cv2.BORDER_REFLECT_101)
+        return padded[y0 + pad_top : y0 + pad_top + tile_size, x0 + pad_left : x0 + pad_left + tile_size]
+    else:
+        return image_bgr[y0 : y0 + tile_size, x0 : x0 + tile_size]
+
+
+def generate_tiles(
+    image_bgr: np.ndarray,
+    deviation_regions: List[Any],
+    tile_size: int = 256,
+    stride: int = 256,
+) -> List[Dict[str, Any]]:
+    """
+    Generates regular grid tiles across the entire image and focused extra tiles
+    around each deviation anomaly region.
+
+    Retained as backward-compatible wrapper that delegates to generate_tile_definitions
+    and extract_tile_crop.
+    """
+    tile_defs = generate_tile_definitions(
+        image_shape=image_bgr.shape[:2],
+        deviation_regions=deviation_regions,
+        tile_size=tile_size,
+        stride=stride,
+    )
+    tiles: List[Dict[str, Any]] = []
+    for t_def in tile_defs:
+        crop = extract_tile_crop(image_bgr, t_def, tile_size=tile_size)
+        tiles.append({
+            "tile_bgr": crop,
+            "bbox": t_def["bbox"],
+            "source": t_def["source"],
+            "region": t_def["region"],
+        })
     return tiles
 
 
@@ -482,78 +545,127 @@ def save_finding_crops(
         f.image_crop_url = f"/api/inspections/{insp_id_str}/artifacts/{filename}"
 
 
-def detect_damage(
-    rectified_left_bgr: np.ndarray,
-    deviation_regions: List[Any],
-    disparity: Optional[np.ndarray] = None,
-    intrinsics: Optional[Dict[str, float]] = None,
-    tile: int = 256,
-    threshold: float = 0.5,
-    classifier: Optional[Any] = None,
-    model_path: Optional[Union[str, Path]] = None,
-    job_dir: Optional[Path] = None,
-    inspection_id: Optional[str] = None,
-) -> DamageDetectionResult:
-    """
-    Executes Stage 4 Damage Detection and Potential Crack Classification.
-
-    Combines EfficientNet-B0 visual crack predictions with Stage 3 geometric
-    surface deviation regions.
-
-    Args:
-        rectified_left_bgr: (H, W, 3) uint8 BGR rectified left image.
-        deviation_regions: List of DeviationRegion instances from Stage 3.
-        disparity: Optional (H, W) float disparity map.
-        intrinsics: Optional dict of camera parameters (fx, fy, cx, cy, baseline_mm).
-        tile: Tile dimension in pixels (default 256).
-        threshold: Crack probability classification threshold (default 0.5).
-        classifier: Optional classifier instance or callable stub for testing.
-        model_path: Optional path to model weights checkpoint.
-        job_dir: Optional working directory for persisting finding crops.
-        inspection_id: Optional ID for generating artifact URLs.
-
-    Returns:
-        DamageDetectionResult containing classified findings, status, and stats.
-    """
-    # 1. Initialize or resolve classifier
-    clf = classifier
-    if clf is None:
-        clf = CrackClassifier.get_instance(model_path=model_path)
-
-    classifier_status = getattr(clf, "status", "unavailable")
-    classifier_error = getattr(clf, "error", None)
-
-    # Convert deviation regions to standard dict representations
+def normalize_deviation_regions(deviation_regions: List[Any]) -> List[Dict[str, Any]]:
+    """Converts a list of DeviationRegion objects or dicts into standard dict representation."""
     regions_list: List[Dict[str, Any]] = []
     for r in deviation_regions:
         if isinstance(r, dict):
-            regions_list.append(r)
+            r_norm = dict(r)
+            if "bbox_px" in r and isinstance(r["bbox_px"], dict):
+                bp = r["bbox_px"]
+                r_norm.setdefault("x", int(bp.get("x", 0)))
+                r_norm.setdefault("y", int(bp.get("y", 0)))
+                r_norm.setdefault("width", int(bp.get("width", 0)))
+                r_norm.setdefault("height", int(bp.get("height", 0)))
+            elif "bbox" in r:
+                bx = r["bbox"]
+                if len(bx) == 4:
+                    x1, y1, x2, y2 = bx
+                    if x2 > x1 and y2 > y1 and "width" not in r:
+                        w, h = x2 - x1, y2 - y1
+                        x, y = x1, y1
+                    else:
+                        x, y, w, h = bx[0], bx[1], bx[2], bx[3]
+                else:
+                    x, y, w, h = 0, 0, 0, 0
+                r_norm.setdefault("x", x)
+                r_norm.setdefault("y", y)
+                r_norm.setdefault("width", w)
+                r_norm.setdefault("height", h)
+                r_norm.setdefault("bbox_px", {"x": x, "y": y, "width": w, "height": h})
+            else:
+                x = int(r.get("x", 0))
+                y = int(r.get("y", 0))
+                w = int(r.get("width", 0))
+                h = int(r.get("height", 0))
+                r_norm.setdefault("x", x)
+                r_norm.setdefault("y", y)
+                r_norm.setdefault("width", w)
+                r_norm.setdefault("height", h)
+                r_norm.setdefault("bbox_px", {"x": x, "y": y, "width": w, "height": h})
+            regions_list.append(r_norm)
         else:
+            x = getattr(r, "x", 0)
+            y = getattr(r, "y", 0)
+            w = getattr(r, "width", 0)
+            h = getattr(r, "height", 0)
+            bbox_px = getattr(r, "bbox_px", {"x": x, "y": y, "width": w, "height": h})
             regions_list.append({
                 "id": getattr(r, "id", None),
-                "x": getattr(r, "x", 0),
-                "y": getattr(r, "y", 0),
-                "width": getattr(r, "width", 0),
-                "height": getattr(r, "height", 0),
-                "bbox_px": getattr(r, "bbox_px", {"x": r.x, "y": r.y, "width": r.width, "height": r.height}),
+                "x": x,
+                "y": y,
+                "width": w,
+                "height": h,
+                "bbox_px": bbox_px,
                 "max_abs_deviation_mm": getattr(r, "max_abs_deviation_mm", 0.0),
                 "mean_deviation_mm": getattr(r, "mean_deviation_mm", 0.0),
                 "centroid_3d_viewer": getattr(r, "centroid_3d_viewer", None),
                 "sign": getattr(r, "sign", "irregularity"),
             })
+    return regions_list
 
-    # If classifier is not ready/available, produce surface_irregularity findings from deviations only
+
+def classify_tile_batch(
+    image_bgr: np.ndarray,
+    tile_defs_batch: List[Dict[str, Any]],
+    classifier: Optional[Any] = None,
+    batch_size: int = 16,
+) -> List[float]:
+    """
+    Extracts image crops for a batch of tile definitions and runs batched inference
+    using the specified or singleton CrackClassifier.
+    Returns a list of float crack probabilities (class index 1).
+    """
+    if not tile_defs_batch:
+        return []
+
+    crops = [extract_tile_crop(image_bgr, td) for td in tile_defs_batch]
+    clf = classifier if classifier is not None else CrackClassifier.get_instance()
+    try:
+        probs = clf.predict_batch(crops, batch_size=batch_size)
+    except TypeError:
+        probs = clf.predict_batch(crops)
+    return [float(p) for p in probs]
+
+
+def aggregate_damage_findings(
+    deviation_regions: List[Any],
+    tile_defs: Optional[List[Dict[str, Any]]] = None,
+    probabilities: Optional[List[float]] = None,
+    disparity: Optional[np.ndarray] = None,
+    intrinsics: Optional[Dict[str, float]] = None,
+    threshold: float = 0.5,
+    classifier_status: str = "completed",
+    classifier_error: Optional[str] = None,
+    clf_device: Optional[str] = None,
+    tiles_evaluated_count: Optional[int] = None,
+    job_dir: Optional[Path] = None,
+    image_bgr: Optional[np.ndarray] = None,
+    inspection_id: Optional[str] = None,
+) -> DamageDetectionResult:
+    """
+    Unified finding aggregation using M2 correlation logic.
+    Combines tile classifications and geometric deviation regions into categorized,
+    calibrated Findings without duplicate logic between local and distributed execution.
+    """
+    regions_list = normalize_deviation_regions(deviation_regions)
+
+    # 1. Fallback when classifier is unavailable or failed
     if classifier_status != "completed":
+        is_inference_error = bool(classifier_error and "Inference error" in classifier_error)
+        description_reason = "classifier inference failed." if is_inference_error else "classifier unavailable."
+        tiles_eval = tiles_evaluated_count if tiles_evaluated_count is not None else (len(tile_defs) if (tile_defs and is_inference_error) else 0)
+
         findings: List[Finding] = []
         for reg in regions_list:
-            bbox = reg.get("bbox_px") or {"x": reg["x"], "y": reg["y"], "width": reg["width"], "height": reg["height"]}
+            bbox = reg.get("bbox_px") or {"x": reg.get("x", 0), "y": reg.get("y", 0), "width": reg.get("width", 0), "height": reg.get("height", 0)}
             c3d = reg.get("centroid_3d_viewer")
             f = Finding(
                 id="",
                 type="surface_irregularity",
                 confidence=None,
                 geometric_deviation_mm=round(float(reg.get("max_abs_deviation_mm", 0.0)), 2),
-                description=f"Surface geometric irregularity ({reg.get('sign', 'anomaly')}) detected from 3D surface deviation; classifier unavailable.",
+                description=f"Surface geometric irregularity ({reg.get('sign', 'anomaly')}) detected from 3D surface deviation; {description_reason}",
                 bounding_box_2d={
                     "x": float(bbox["x"]),
                     "y": float(bbox["y"]),
@@ -565,75 +677,35 @@ def detect_damage(
             findings.append(f)
 
         sorted_findings = sort_findings(findings)
-        save_finding_crops(sorted_findings, rectified_left_bgr, job_dir, inspection_id)
+        if job_dir is not None and image_bgr is not None:
+            save_finding_crops(sorted_findings, image_bgr, job_dir, inspection_id)
 
         return DamageDetectionResult(
             findings=sorted_findings,
             classifier_status=classifier_status,
             classifier_error=classifier_error,
             stats={
-                "tiles_evaluated": 0,
+                "tiles_evaluated": tiles_eval,
                 "positive_tiles": 0,
                 "merged_groups": 0,
                 "findings_count": len(sorted_findings),
             },
         )
 
-    # 2. Tile Generation
-    tiles = generate_tiles(rectified_left_bgr, regions_list, tile_size=tile, stride=tile)
-    tile_images = [t["tile_bgr"] for t in tiles]
-
-    # 3. Batch Inference
-    try:
-        probabilities = clf.predict_batch(tile_images, batch_size=16)
-    except Exception as exc:
-        # Graceful fallback on inference failure
-        findings = []
-        for reg in regions_list:
-            bbox = reg.get("bbox_px") or {"x": reg["x"], "y": reg["y"], "width": reg["width"], "height": reg["height"]}
-            c3d = reg.get("centroid_3d_viewer")
-            f = Finding(
-                id="",
-                type="surface_irregularity",
-                confidence=None,
-                geometric_deviation_mm=round(float(reg.get("max_abs_deviation_mm", 0.0)), 2),
-                description=f"Surface geometric irregularity ({reg.get('sign', 'anomaly')}) detected from 3D surface deviation; classifier inference failed.",
-                bounding_box_2d={
-                    "x": float(bbox["x"]),
-                    "y": float(bbox["y"]),
-                    "width": float(bbox["width"]),
-                    "height": float(bbox["height"]),
-                },
-                region_center_3d=[round(float(v), 2) for v in c3d] if c3d else None,
-            )
-            findings.append(f)
-
-        sorted_findings = sort_findings(findings)
-        save_finding_crops(sorted_findings, rectified_left_bgr, job_dir, inspection_id)
-
-        return DamageDetectionResult(
-            findings=sorted_findings,
-            classifier_status="failed",
-            classifier_error=f"Inference error: {exc}",
-            stats={
-                "tiles_evaluated": len(tiles),
-                "positive_tiles": 0,
-                "merged_groups": 0,
-                "findings_count": len(sorted_findings),
-            },
-        )
-
-    # 4. Filter Positive Tiles
+    # 2. Filter positive tiles
+    tile_defs = tile_defs or []
+    probabilities = probabilities or []
     positive_tiles: List[Dict[str, Any]] = []
-    for t, prob in zip(tiles, probabilities):
-        t["prob"] = float(prob)
+    for t_def, prob in zip(tile_defs, probabilities):
+        t_copy = dict(t_def)
+        t_copy["prob"] = float(prob)
         if prob >= threshold:
-            positive_tiles.append(t)
+            positive_tiles.append(t_copy)
 
-    # 5. Merge Positive Tiles
+    # 3. Merge positive tiles
     merged_groups = merge_positive_tiles(positive_tiles)
 
-    # 6. Correlate with M1 Deviation Regions
+    # 4. Correlate with M1 deviation regions
     findings: List[Finding] = []
     matched_region_indices = set()
 
@@ -641,13 +713,12 @@ def detect_damage(
         g_box = grp["bbox"]
         g_conf = grp["confidence"]
 
-        # Find overlapping deviation regions
         matched_reg = None
         best_reg_dev = -1.0
         best_reg_idx = -1
 
         for idx, reg in enumerate(regions_list):
-            reg_box = reg.get("bbox_px") or {"x": reg["x"], "y": reg["y"], "width": reg["width"], "height": reg["height"]}
+            reg_box = reg.get("bbox_px") or {"x": reg.get("x", 0), "y": reg.get("y", 0), "width": reg.get("width", 0), "height": reg.get("height", 0)}
             if boxes_overlap(g_box, reg_box) or reg in grp["associated_regions"]:
                 dev_val = float(reg.get("max_abs_deviation_mm", 0.0))
                 if dev_val > best_reg_dev:
@@ -658,8 +729,7 @@ def detect_damage(
         if matched_reg is not None:
             # Case A: Positive group overlaps deviation region -> potential_crack
             matched_region_indices.add(best_reg_idx)
-            reg_box = matched_reg.get("bbox_px") or {"x": matched_reg["x"], "y": matched_reg["y"], "width": matched_reg["width"], "height": matched_reg["height"]}
-            # Union of group box and matched region box
+            reg_box = matched_reg.get("bbox_px") or {"x": matched_reg.get("x", 0), "y": matched_reg.get("y", 0), "width": matched_reg.get("width", 0), "height": matched_reg.get("height", 0)}
             ux1 = min(g_box["x"], reg_box["x"])
             uy1 = min(g_box["y"], reg_box["y"])
             ux2 = max(g_box["x"] + g_box["width"], reg_box["x"] + reg_box["width"])
@@ -719,7 +789,7 @@ def detect_damage(
     for idx, reg in enumerate(regions_list):
         if idx in matched_region_indices:
             continue
-        reg_box = reg.get("bbox_px") or {"x": reg["x"], "y": reg["y"], "width": reg["width"], "height": reg["height"]}
+        reg_box = reg.get("bbox_px") or {"x": reg.get("x", 0), "y": reg.get("y", 0), "width": reg.get("width", 0), "height": reg.get("height", 0)}
         c3d = reg.get("centroid_3d_viewer")
         f = Finding(
             id="",
@@ -737,24 +807,99 @@ def detect_damage(
         )
         findings.append(f)
 
-    # 7. Sort findings and assign sequential Finding IDs
+    # 5. Sort findings and assign sequential Finding IDs
     sorted_findings = sort_findings(findings)
 
-    # 8. Save image crops
-    save_finding_crops(sorted_findings, rectified_left_bgr, job_dir, inspection_id)
+    if job_dir is not None and image_bgr is not None:
+        save_finding_crops(sorted_findings, image_bgr, job_dir, inspection_id)
 
     return DamageDetectionResult(
         findings=sorted_findings,
         classifier_status=classifier_status,
         classifier_error=None,
         stats={
-            "tiles_evaluated": len(tiles),
+            "tiles_evaluated": len(tile_defs) if tile_defs else 0,
             "positive_tiles": len(positive_tiles),
             "merged_groups": len(merged_groups),
             "findings_count": len(sorted_findings),
             "potential_cracks": sum(1 for f in sorted_findings if f.type == "potential_crack"),
             "surface_irregularities": sum(1 for f in sorted_findings if f.type == "surface_irregularity"),
             "minor_anomalies": sum(1 for f in sorted_findings if f.type == "minor_anomaly"),
-            "device": str(getattr(clf, "device", "cpu")),
+            "device": str(clf_device or "cpu"),
         },
+    )
+
+
+def detect_damage(
+    rectified_left_bgr: np.ndarray,
+    deviation_regions: List[Any],
+    disparity: Optional[np.ndarray] = None,
+    intrinsics: Optional[Dict[str, float]] = None,
+    tile: int = 256,
+    threshold: float = 0.5,
+    classifier: Optional[Any] = None,
+    model_path: Optional[Union[str, Path]] = None,
+    job_dir: Optional[Path] = None,
+    inspection_id: Optional[str] = None,
+) -> DamageDetectionResult:
+    """
+    Executes Stage 4 Damage Detection and Potential Crack Classification.
+
+    Combines EfficientNet-B0 visual crack predictions with Stage 3 geometric
+    surface deviation regions. Retained as backward-compatible sequential wrapper
+    delegating to modular functions.
+    """
+    # 1. Initialize or resolve classifier
+    clf = classifier if classifier is not None else CrackClassifier.get_instance(model_path=model_path)
+    classifier_status = getattr(clf, "status", "unavailable")
+    classifier_error = getattr(clf, "error", None)
+
+    # If classifier is not ready/available, produce surface_irregularity findings from deviations only
+    if classifier_status != "completed":
+        return aggregate_damage_findings(
+            deviation_regions=deviation_regions,
+            classifier_status=classifier_status,
+            classifier_error=classifier_error,
+            job_dir=job_dir,
+            image_bgr=rectified_left_bgr,
+            inspection_id=inspection_id,
+        )
+
+    # 2. Tile Generation
+    tile_defs = generate_tile_definitions(
+        image_shape=rectified_left_bgr.shape[:2],
+        deviation_regions=deviation_regions,
+        tile_size=tile,
+        stride=tile,
+    )
+
+    # 3. Batch Inference with fallback
+    try:
+        probabilities = classify_tile_batch(rectified_left_bgr, tile_defs, clf)
+    except Exception as exc:
+        return aggregate_damage_findings(
+            deviation_regions=deviation_regions,
+            tile_defs=tile_defs,
+            classifier_status="failed",
+            classifier_error=f"Inference error: {exc}",
+            tiles_evaluated_count=len(tile_defs),
+            job_dir=job_dir,
+            image_bgr=rectified_left_bgr,
+            inspection_id=inspection_id,
+        )
+
+    # 4. Aggregate findings and save crops
+    return aggregate_damage_findings(
+        deviation_regions=deviation_regions,
+        tile_defs=tile_defs,
+        probabilities=probabilities,
+        disparity=disparity,
+        intrinsics=intrinsics,
+        threshold=threshold,
+        classifier_status=classifier_status,
+        classifier_error=None,
+        clf_device=getattr(clf, "device", "cpu"),
+        job_dir=job_dir,
+        image_bgr=rectified_left_bgr,
+        inspection_id=inspection_id,
     )

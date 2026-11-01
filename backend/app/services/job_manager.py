@@ -15,18 +15,26 @@ Manages inspection job lifecycles:
 
 from pathlib import Path
 from typing import Dict, List, Optional, Any
+import fcntl
 import json
 import os
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+import logging
+
+logger = logging.getLogger(__name__)
 
 from ..models.inspection import (
     InspectionResponse,
     ImageFileMeta,
     CalibrationSummary,
     Finding,
+    FanoutRunState,
+    BatchRecord,
+    BatchDefinition,
+    FanoutStatus,
 )
 from ..models.calibration import StereoCalibration
 from ..pipeline.runner import run_pipeline, PipelineExecutionResult
@@ -52,11 +60,42 @@ class JobManager:
         self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="surface-worker")
         self._lock = threading.Lock()
         self._jobs: Dict[str, InspectionResponse] = {}
+        self._fanout_states: Dict[str, FanoutRunState] = {}
         self._monotonic_heartbeats: Dict[str, float] = {}
+        self._lock_file_fd = None
         self._load_existing_jobs()
 
+    def acquire_storage_lock(self):
+        """
+        Acquires an exclusive advisory OS-level lock on the storage directory.
+        Fails fast if another Surface master process is already running.
+        """
+        lock_path = self.storage_dir.parent / ".master.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        if self._lock_file_fd is None:
+            self._lock_file_fd = open(lock_path, "a+")
+        try:
+            fcntl.flock(self._lock_file_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError) as exc:
+            raise RuntimeError(
+                f"Another Surface master process is already running and holds the storage lock at {lock_path}."
+            ) from exc
+
+    def release_storage_lock(self):
+        """Releases the exclusive advisory storage lock if held."""
+        if self._lock_file_fd is not None:
+            try:
+                fcntl.flock(self._lock_file_fd.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                self._lock_file_fd.close()
+            except Exception:
+                pass
+            self._lock_file_fd = None
+
     def _load_existing_jobs(self):
-        """Scans storage directory and loads prior inspections into memory."""
+        """Scans storage directory and loads prior inspections and fanout states into memory."""
         with self._lock:
             for job_dir in self.storage_dir.iterdir():
                 if job_dir.is_dir():
@@ -69,6 +108,31 @@ class JobManager:
                             self._jobs[inspection.id] = inspection
                         except Exception:
                             # Skip corrupted historical records
+                            pass
+                    fanout_file = job_dir / "fanout_state.json"
+                    if fanout_file.exists():
+                        try:
+                            with open(fanout_file, "r", encoding="utf-8") as f:
+                                f_data = json.load(f)
+                            fanout = FanoutRunState(**f_data)
+                            self._fanout_states[fanout.inspection_id] = fanout
+                            if fanout.inspection_id in self._jobs:
+                                job = self._jobs[fanout.inspection_id]
+                                needs_sync = (
+                                    job.fanout_status != fanout.status
+                                    or job.fanout_run_id != fanout.fanout_run_id
+                                    or job.delegation_token != fanout.delegation_token
+                                    or job.finalizer_worker != fanout.finalizer_worker
+                                    or job.finalizer_generation != fanout.finalizer_generation
+                                )
+                                job.fanout_status = fanout.status
+                                job.fanout_run_id = fanout.fanout_run_id
+                                job.delegation_token = fanout.delegation_token
+                                job.finalizer_worker = fanout.finalizer_worker
+                                job.finalizer_generation = fanout.finalizer_generation
+                                if needs_sync:
+                                    self._save_job_state(job)
+                        except Exception:
                             pass
 
     def _save_job_state(self, inspection: InspectionResponse):
@@ -91,14 +155,34 @@ class JobManager:
         except Exception:
             pass
 
-    def _validate_lease_locked(
+    def _save_fanout_state_locked(self, fanout: FanoutRunState):
+        """Persists authoritative fan-out state to fanout_state.json atomically."""
+        job_dir = self.storage_dir / fanout.inspection_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        final_file = job_dir / "fanout_state.json"
+        tmp_file = job_dir / f".fanout_{uuid.uuid4().hex}.tmp"
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(fanout.model_dump(), f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_file, final_file)
+        try:
+            dir_fd = os.open(str(job_dir), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except Exception:
+            pass
+
+    def _validate_coordinator_lease_locked(
         self,
         inspection_id: str,
         lease_token: int,
         worker_name: Optional[str] = None,
     ):
         """
-        Validates ownership and fencing lease within self._lock.
+        Validates coordinator ownership and fencing lease within self._lock.
         Raises KeyError if inspection does not exist.
         Raises LeaseConflictError if job is in a terminal state, lease token mismatches,
         or worker identity mismatches.
@@ -116,6 +200,120 @@ class JobManager:
             raise LeaseConflictError(
                 f"Worker identity mismatch: job '{inspection_id}' is bound to worker '{job.assigned_worker}', "
                 f"but request came from '{worker_name}'."
+            )
+
+    def _validate_batch_operation_locked(
+        self,
+        inspection_id: str,
+        lease_token: int,
+        fanout_run_id: str,
+        batch_id: int,
+    ):
+        """
+        Validates batch-level authority within self._lock.
+        Allows any cluster worker with valid worker token and active lease.
+        Enforces matching fanout_run_id and FANOUT_RUNNING status.
+        """
+        if inspection_id not in self._jobs:
+            raise KeyError(f"Inspection '{inspection_id}' not found.")
+        job = self._jobs[inspection_id]
+        if job.status in ("completed", "failed"):
+            raise LeaseConflictError(f"Job '{inspection_id}' is already in terminal state '{job.status}'.")
+        if job.lease_token != lease_token:
+            raise LeaseConflictError(
+                f"Fencing lease token mismatch: job lease is {job.lease_token}, but request provided {lease_token}."
+            )
+        fanout = self._fanout_states.get(inspection_id)
+        if not fanout or fanout.lease_token != lease_token or fanout.fanout_run_id != fanout_run_id:
+            raise LeaseConflictError(
+                f"Fanout mismatch: run id '{fanout_run_id}' or lease {lease_token} not active for job '{inspection_id}'."
+            )
+        if fanout.status != "FANOUT_RUNNING":
+            if (
+                fanout.status in ("ALL_BATCHES_COMMITTED", "CALLBACK_PENDING")
+                or (str(batch_id) in fanout.batches and fanout.batches[str(batch_id)].state == "committed")
+            ):
+                pass
+            else:
+                raise LeaseConflictError(
+                    f"Cannot perform batch operation in fanout state '{fanout.status}' (expected FANOUT_RUNNING)."
+                )
+        if str(batch_id) not in fanout.batches:
+            raise KeyError(f"Batch {batch_id} not found in fanout definition for job '{inspection_id}'.")
+
+    def _validate_finalizer_lease_locked(
+        self,
+        inspection_id: str,
+        lease_token: int,
+        worker_name: str,
+        delegation_token: str,
+        finalizer_generation: int,
+    ):
+        """
+        Validates finalizer delegation credentials within self._lock.
+        Requires matching lease token, delegation token, generation, and non-expired window.
+        """
+        if inspection_id not in self._jobs:
+            raise KeyError(f"Inspection '{inspection_id}' not found.")
+        job = self._jobs[inspection_id]
+        if job.status in ("completed", "failed"):
+            raise LeaseConflictError(f"Job '{inspection_id}' is already in terminal state '{job.status}'.")
+        if job.lease_token != lease_token:
+            raise LeaseConflictError(
+                f"Fencing lease token mismatch: job lease is {job.lease_token}, but request provided {lease_token}."
+            )
+        fanout = self._fanout_states.get(inspection_id)
+        if not fanout or fanout.lease_token != lease_token:
+            raise LeaseConflictError(f"No active fanout state matching lease {lease_token} for job '{inspection_id}'.")
+        if fanout.status != "FINALIZATION_RUNNING":
+            raise LeaseConflictError(
+                f"Finalizer operation rejected: fanout status is '{fanout.status}', expected 'FINALIZATION_RUNNING'."
+            )
+        if fanout.delegation_token != delegation_token:
+            raise LeaseConflictError("Finalizer delegation token mismatch or revoked.")
+        if fanout.finalizer_worker != worker_name:
+            raise LeaseConflictError(
+                f"Finalizer worker mismatch: delegated to '{fanout.finalizer_worker}', but request from '{worker_name}'."
+            )
+        if fanout.finalizer_generation != finalizer_generation:
+            raise LeaseConflictError(
+                f"Finalizer generation mismatch: current generation is {fanout.finalizer_generation}, "
+                f"but request provided {finalizer_generation}."
+            )
+        now_wall = time.time()
+        if fanout.finalizer_expires_at is not None and now_wall > fanout.finalizer_expires_at:
+            raise LeaseConflictError(
+                f"Finalizer delegation has expired (expired at {fanout.finalizer_expires_at}, now {now_wall})."
+            )
+
+    def _validate_lease_locked(
+        self,
+        inspection_id: str,
+        lease_token: int,
+        worker_name: Optional[str] = None,
+        delegation_token: Optional[str] = None,
+        finalizer_generation: Optional[int] = None,
+    ):
+        """
+        Unified lease validation within self._lock.
+        If delegation_token is provided, delegates to _validate_finalizer_lease_locked.
+        Otherwise, validates coordinator lease via _validate_coordinator_lease_locked.
+        """
+        if delegation_token is not None:
+            if not worker_name or finalizer_generation is None:
+                raise LeaseConflictError("Finalizer operation requires worker_name and finalizer_generation.")
+            self._validate_finalizer_lease_locked(
+                inspection_id=inspection_id,
+                lease_token=lease_token,
+                worker_name=worker_name,
+                delegation_token=delegation_token,
+                finalizer_generation=finalizer_generation,
+            )
+        else:
+            self._validate_coordinator_lease_locked(
+                inspection_id=inspection_id,
+                lease_token=lease_token,
+                worker_name=worker_name,
             )
 
     def claim_manifest(
@@ -184,6 +382,8 @@ class JobManager:
         duration_sec: Optional[float] = None,
         message: Optional[str] = None,
         lease_token: Optional[int] = None,
+        delegation_token: Optional[str] = None,
+        finalizer_generation: Optional[int] = None,
     ) -> bool:
         """
         Thread-safe application of a stage progress update.
@@ -198,7 +398,13 @@ class JobManager:
             job = self._jobs[inspection_id]
 
             if lease_token is not None:
-                self._validate_lease_locked(inspection_id, lease_token, worker)
+                self._validate_lease_locked(
+                    inspection_id=inspection_id,
+                    lease_token=lease_token,
+                    worker_name=worker,
+                    delegation_token=delegation_token,
+                    finalizer_generation=finalizer_generation,
+                )
             else:
                 if job.status in ("completed", "failed"):
                     return False
@@ -239,6 +445,8 @@ class JobManager:
         duration_sec: float = 0.0,
         worker: Optional[str] = None,
         lease_token: Optional[int] = None,
+        delegation_token: Optional[str] = None,
+        finalizer_generation: Optional[int] = None,
     ) -> bool:
         """
         Thread-safe application of successful inspection results.
@@ -253,7 +461,13 @@ class JobManager:
             if lease_token is not None:
                 if job.status == "completed":
                     return True
-                self._validate_lease_locked(inspection_id, lease_token, worker)
+                self._validate_lease_locked(
+                    inspection_id=inspection_id,
+                    lease_token=lease_token,
+                    worker_name=worker,
+                    delegation_token=delegation_token,
+                    finalizer_generation=finalizer_generation,
+                )
             else:
                 if job.status in ("completed", "failed"):
                     return False
@@ -305,6 +519,14 @@ class JobManager:
                 if worker and not s.worker:
                     s.worker = worker
 
+            # Synchronize fanout state to TERMINAL if active
+            fanout = self._fanout_states.get(inspection_id)
+            if fanout:
+                fanout.status = "TERMINAL"
+                fanout.finalized_at = time.time()
+                self._save_fanout_state_locked(fanout)
+                job.fanout_status = "TERMINAL"
+
             self._save_job_state(job)
             return True
 
@@ -315,6 +537,8 @@ class JobManager:
         failed_stage_index: Optional[int] = None,
         worker: Optional[str] = None,
         lease_token: Optional[int] = None,
+        delegation_token: Optional[str] = None,
+        finalizer_generation: Optional[int] = None,
     ) -> bool:
         """
         Thread-safe application of a job failure.
@@ -329,7 +553,13 @@ class JobManager:
             if lease_token is not None:
                 if job.status in ("completed", "failed"):
                     return False
-                self._validate_lease_locked(inspection_id, lease_token, worker)
+                self._validate_lease_locked(
+                    inspection_id=inspection_id,
+                    lease_token=lease_token,
+                    worker_name=worker,
+                    delegation_token=delegation_token,
+                    finalizer_generation=finalizer_generation,
+                )
             else:
                 if job.status in ("completed", "failed"):
                     return False
@@ -341,6 +571,14 @@ class JobManager:
                 if worker:
                     job.steps[failed_stage_index].worker = worker
 
+            # Synchronize fanout state to TERMINAL if active
+            fanout = self._fanout_states.get(inspection_id)
+            if fanout:
+                fanout.status = "TERMINAL"
+                fanout.failure_reason = message
+                self._save_fanout_state_locked(fanout)
+                job.fanout_status = "TERMINAL"
+
             self._save_job_state(job)
             return True
 
@@ -351,6 +589,8 @@ class JobManager:
         worker_name: str,
         artifact_name: str,
         staging_path: Path,
+        delegation_token: Optional[str] = None,
+        finalizer_generation: Optional[int] = None,
     ) -> bool:
         """
         Validates fencing lease within self._lock and atomically commits
@@ -359,7 +599,13 @@ class JobManager:
         """
         with self._lock:
             try:
-                self._validate_lease_locked(inspection_id, lease_token, worker_name)
+                self._validate_lease_locked(
+                    inspection_id=inspection_id,
+                    lease_token=lease_token,
+                    worker_name=worker_name,
+                    delegation_token=delegation_token,
+                    finalizer_generation=finalizer_generation,
+                )
             except Exception:
                 staging_path.unlink(missing_ok=True)
                 raise
@@ -461,6 +707,131 @@ class JobManager:
         final_file = outbox_dir / f"dispatch_{lease_token}.json"
         final_file.unlink(missing_ok=True)
 
+    def write_finalizer_outbox_intent_locked(
+        self,
+        inspection_id: str,
+        lease_token: int,
+        fanout_run_id: str,
+        generation: int = 0,
+    ) -> Path:
+        """
+        Durably records a finalizer task dispatch intent before broker publication.
+        """
+        outbox_dir = self.storage_dir / inspection_id / "outbox"
+        outbox_dir.mkdir(parents=True, exist_ok=True)
+        final_file = outbox_dir / f"finalizer_{lease_token}_{generation}.json"
+        tmp_file = outbox_dir / f".finalizer_{lease_token}_{generation}_{uuid.uuid4().hex}.tmp"
+        payload = {
+            "inspection_id": inspection_id,
+            "lease_token": lease_token,
+            "fanout_run_id": fanout_run_id,
+            "generation": generation,
+            "created_at": time.time(),
+            "state": "pending",
+        }
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_file, final_file)
+        try:
+            dir_fd = os.open(str(outbox_dir), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except Exception:
+            pass
+        return final_file
+
+    def mark_finalizer_outbox_published(self, inspection_id: str, lease_token: int, generation: int = 0):
+        """Atomically marks finalizer intent as published."""
+        outbox_dir = self.storage_dir / inspection_id / "outbox"
+        final_file = outbox_dir / f"finalizer_{lease_token}_{generation}.json"
+        if not final_file.exists():
+            return
+        try:
+            with open(final_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            data["state"] = "published"
+            data["published_at"] = time.time()
+            tmp_file = outbox_dir / f".finalizer_{lease_token}_{generation}_{uuid.uuid4().hex}.tmp"
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_file, final_file)
+            try:
+                dir_fd = os.open(str(outbox_dir), os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def cleanup_finalizer_outbox(self, inspection_id: str, lease_token: int, generation: int = 0):
+        """Removes the finalizer outbox record after successful dispatch."""
+        outbox_dir = self.storage_dir / inspection_id / "outbox"
+        final_file = outbox_dir / f"finalizer_{lease_token}_{generation}.json"
+        final_file.unlink(missing_ok=True)
+
+    def write_batch_outbox_intent_locked(
+        self,
+        inspection_id: str,
+        lease_token: int,
+        fanout_run_id: str,
+        batch_id: int,
+        reason: str = "",
+    ) -> Path:
+        """
+        Durably records a batch task redispatch intent before broker publication.
+        Uses temporary staging, flush, fsync, atomic os.replace, and parent directory fsync.
+        """
+        outbox_dir = self.storage_dir / inspection_id / "outbox"
+        outbox_dir.mkdir(parents=True, exist_ok=True)
+        final_file = outbox_dir / f"batch_{lease_token}_{fanout_run_id}_{batch_id}.json"
+        tmp_file = outbox_dir / f".batch_{lease_token}_{fanout_run_id}_{batch_id}_{uuid.uuid4().hex}.tmp"
+        payload = {
+            "inspection_id": inspection_id,
+            "lease_token": lease_token,
+            "fanout_run_id": fanout_run_id,
+            "batch_id": batch_id,
+            "previous_state": "claimed",
+            "intended_state": "pending",
+            "reason": reason,
+            "created_at": time.time(),
+            "state": "pending",
+        }
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_file, final_file)
+        try:
+            dir_fd = os.open(str(outbox_dir), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except Exception:
+            pass
+        return final_file
+
+    def cleanup_batch_outbox(
+        self,
+        inspection_id: str,
+        lease_token: int,
+        fanout_run_id: str,
+        batch_id: int,
+    ):
+        """Removes the batch outbox record after successful broker publication."""
+        outbox_dir = self.storage_dir / inspection_id / "outbox"
+        final_file = outbox_dir / f"batch_{lease_token}_{fanout_run_id}_{batch_id}.json"
+        final_file.unlink(missing_ok=True)
+
     def reconcile_outbox_on_startup(self) -> int:
         """
         Scans storage for uncommitted/pending outbox records on master startup or supervisor tick.
@@ -487,8 +858,156 @@ class JobManager:
 
             for item in list(outbox_dir.iterdir()):
                 # Clean up dangling temporary files
-                if item.name.startswith(".dispatch_") and item.name.endswith(".tmp"):
+                if (
+                    item.name.startswith(".dispatch_")
+                    or item.name.startswith(".finalizer_")
+                    or item.name.startswith(".batch_")
+                ) and item.name.endswith(".tmp"):
                     item.unlink(missing_ok=True)
+                    continue
+
+                if item.name.startswith("batch_") and item.name.endswith(".json"):
+                    try:
+                        with open(item, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        state = data.get("state")
+                        insp_id = data.get("inspection_id")
+                        intent_lease = data.get("lease_token", 1)
+                        intent_run_id = data.get("fanout_run_id")
+                        b_id = data.get("batch_id")
+
+                        if state == "published":
+                            item.unlink(missing_ok=True)
+                            continue
+
+                        should_dispatch = False
+                        with self._lock:
+                            job = self._jobs.get(insp_id)
+                            if job is None or job.status in ("completed", "failed") or job.lease_token != intent_lease:
+                                item.unlink(missing_ok=True)
+                                continue
+
+                            fanout = self._fanout_states.get(insp_id)
+                            if not fanout or fanout.lease_token != intent_lease or fanout.fanout_run_id != intent_run_id:
+                                item.unlink(missing_ok=True)
+                                continue
+
+                            batch = fanout.batches.get(str(b_id))
+                            if not batch or batch.state == "committed":
+                                item.unlink(missing_ok=True)
+                                continue
+
+                            # Interrupted transition: if still claimed, complete transition to pending
+                            if batch.state == "claimed":
+                                batch.state = "pending"
+                                batch.claimed_by = None
+                                batch.claim_token = None
+                                batch.claim_expires_at = None
+                                self._save_fanout_state_locked(fanout)
+
+                            if batch.state == "pending" and fanout.status == "FANOUT_RUNNING":
+                                should_dispatch = True
+
+                        if should_dispatch and settings.get_execution_mode() == "celery":
+                            try:
+                                from ..tasks import classify_batch_task
+                                classify_batch_task.delay(insp_id, intent_lease, intent_run_id, b_id)
+                                republished += 1
+                                self.cleanup_batch_outbox(insp_id, intent_lease, intent_run_id, b_id)
+                            except Exception:
+                                pass
+                        elif not should_dispatch:
+                            item.unlink(missing_ok=True)
+                    except Exception:
+                        item.unlink(missing_ok=True)
+                    continue
+
+                if item.name.startswith("finalizer_") and item.name.endswith(".json"):
+                    try:
+                        with open(item, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                    except (json.JSONDecodeError, OSError) as read_err:
+                        logger.warning(f"Discarding unreadable finalizer intent {item.name}: {read_err}")
+                        item.unlink(missing_ok=True)
+                        continue
+
+                    insp_id = data.get("inspection_id")
+                    intent_lease = data.get("lease_token", 1)
+                    intent_gen = data.get("generation", 0)
+                    intent_run_id = data.get("fanout_run_id")
+                    intent_state = data.get("state", "pending")
+
+                    should_dispatch = False
+                    with self._lock:
+                        job = self._jobs.get(insp_id)
+                        if job is None or job.status in ("completed", "failed") or job.lease_token != intent_lease:
+                            item.unlink(missing_ok=True)
+                            continue
+
+                        fanout = self._fanout_states.get(insp_id)
+                        if not fanout or fanout.lease_token != intent_lease or fanout.fanout_run_id != intent_run_id:
+                            item.unlink(missing_ok=True)
+                            continue
+
+                        # Generation check:
+                        # An intent is valid for dispatch if and only if it matches the authoritative committed generation.
+                        # - intent_gen < fanout.finalizer_generation: Stale older generation (superseded by newer takeover).
+                        # - intent_gen > fanout.finalizer_generation: Uncommitted future intent written before a crash prior
+                        #   to fanout_state.json persistence. Must NOT be dispatched or advance generation; safely discarded.
+                        if intent_gen != fanout.finalizer_generation:
+                            logger.info(
+                                f"Startup reconciliation: discarding mismatched finalizer intent {item.name} "
+                                f"(intent gen {intent_gen} != authoritative gen {fanout.finalizer_generation})."
+                            )
+                            item.unlink(missing_ok=True)
+                            continue
+
+                        # Check if already durably claimed by an active, unexpired finalizer of this generation
+                        is_actively_claimed = (
+                            fanout.status == "FINALIZATION_RUNNING"
+                            and fanout.finalizer_generation == intent_gen
+                            and fanout.delegation_token is not None
+                            and fanout.finalizer_expires_at is not None
+                            and time.time() <= fanout.finalizer_expires_at
+                        )
+                        if is_actively_claimed:
+                            item.unlink(missing_ok=True)
+                            continue
+
+                        # Valid unacknowledged finalizer intent for pending or expired callback
+                        now_wall = time.time()
+                        is_expired_finalizer = (
+                            fanout.status == "FINALIZATION_RUNNING"
+                            and fanout.finalizer_expires_at is not None
+                            and now_wall > fanout.finalizer_expires_at
+                        )
+                        is_pending_callback = fanout.status in ("CALLBACK_PENDING", "ALL_BATCHES_COMMITTED")
+
+                        if is_pending_callback or is_expired_finalizer:
+                            if intent_state == "pending":
+                                should_dispatch = True
+                            elif intent_state == "published":
+                                if fanout.callback_dispatched_at is None or (now_wall - fanout.callback_dispatched_at) > 30.0:
+                                    should_dispatch = True
+                        else:
+                            # Not in a state that expects a finalizer
+                            item.unlink(missing_ok=True)
+                            continue
+
+                    if should_dispatch and settings.get_execution_mode() == "celery":
+                        try:
+                            from ..tasks import finalize_inspection_task
+                            finalize_inspection_task.delay(insp_id, intent_lease, intent_run_id)
+                            republished += 1
+                            self.mark_finalizer_outbox_published(insp_id, intent_lease, intent_gen)
+                            with self._lock:
+                                f_curr = self._fanout_states.get(insp_id)
+                                if f_curr:
+                                    f_curr.callback_dispatched_at = time.time()
+                                    self._save_fanout_state_locked(f_curr)
+                            logger.info(f"Startup reconciliation: republished finalizer for {insp_id} (gen {intent_gen}).")
+                        except Exception as exc:
+                            logger.error(f"Startup reconciliation: failed to publish finalizer for {insp_id}: {exc}")
                     continue
 
                 if item.name.startswith("dispatch_") and item.name.endswith(".json"):
@@ -553,6 +1072,25 @@ class JobManager:
                             item.unlink(missing_ok=True)
                     except Exception:
                         item.unlink(missing_ok=True)
+
+        # Reconcile fan-out states: if ALL_BATCHES_COMMITTED without pending finalizer intent, repair it
+        with self._lock:
+            for fanout in list(self._fanout_states.values()):
+                if fanout.status == "ALL_BATCHES_COMMITTED":
+                    self.write_finalizer_outbox_intent_locked(
+                        inspection_id=fanout.inspection_id,
+                        lease_token=fanout.lease_token,
+                        fanout_run_id=fanout.fanout_run_id,
+                        generation=0,
+                    )
+                    fanout.status = "CALLBACK_PENDING"
+                    fanout.callback_dispatched_at = time.time()
+                    self._save_fanout_state_locked(fanout)
+                    job = self._jobs.get(fanout.inspection_id)
+                    if job:
+                        job.fanout_status = "CALLBACK_PENDING"
+                        self._save_job_state(job)
+
         return republished
 
     def reassign_orphaned_job(
@@ -576,6 +1114,16 @@ class JobManager:
                 return None
             if job.lease_token != expected_lease_token:
                 # Concurrent bump or mismatch
+                return None
+
+            fanout = self._fanout_states.get(inspection_id)
+            if fanout and fanout.status in (
+                "FANOUT_RUNNING",
+                "ALL_BATCHES_COMMITTED",
+                "CALLBACK_PENDING",
+                "FINALIZATION_RUNNING",
+            ):
+                # Job is in fan-out or finalizer phase; preserve committed progress and do not reset coordinator
                 return None
 
             new_lease = expected_lease_token + 1
@@ -605,6 +1153,460 @@ class JobManager:
 
             self._save_job_state(job)
             return new_lease
+
+    def init_fanout(
+        self,
+        inspection_id: str,
+        lease_token: int,
+        worker_name: str,
+        total_batches: int,
+        batches: List[Any],
+    ) -> FanoutRunState:
+        """
+        Initializes a distributed fan-out run for Stage 4 under coordinator lease validation.
+        Creates durable fanout_state.json and updates derived inspection fields.
+        """
+        with self._lock:
+            self._validate_coordinator_lease_locked(inspection_id, lease_token, worker_name)
+            job = self._jobs[inspection_id]
+
+            # Idempotent re-initialization check for same lease
+            existing = self._fanout_states.get(inspection_id)
+            if existing and existing.lease_token == lease_token and existing.status == "FANOUT_RUNNING":
+                return existing
+
+            fanout_run_id = f"fanout_{inspection_id}_{uuid.uuid4().hex[:8]}"
+            batch_records: Dict[str, BatchRecord] = {}
+            for item in batches:
+                if isinstance(item, dict):
+                    bid = int(item["batch_id"])
+                    t_indices = list(item["tile_indices"])
+                else:
+                    bid = int(item.batch_id)
+                    t_indices = list(item.tile_indices)
+                batch_records[str(bid)] = BatchRecord(
+                    batch_id=bid,
+                    tile_indices=t_indices,
+                    state="pending",
+                )
+
+            fanout = FanoutRunState(
+                inspection_id=inspection_id,
+                fanout_run_id=fanout_run_id,
+                lease_token=lease_token,
+                status="FANOUT_RUNNING",
+                total_batches=total_batches,
+                committed_batches=0,
+                batches=batch_records,
+                created_at=time.time(),
+            )
+            self._save_fanout_state_locked(fanout)
+            self._fanout_states[inspection_id] = fanout
+
+            job.fanout_status = "FANOUT_RUNNING"
+            job.fanout_run_id = fanout_run_id
+            job.last_heartbeat_at = time.time()
+            self._monotonic_heartbeats[inspection_id] = time.monotonic()
+            self._save_job_state(job)
+            return fanout
+
+    def claim_batch(
+        self,
+        inspection_id: str,
+        lease_token: int,
+        worker_name: str,
+        fanout_run_id: str,
+        batch_id: int,
+        claim_timeout_sec: float = 30.0,
+    ) -> Dict[str, Any]:
+        """
+        Claims a batch for processing by an authenticated cluster worker.
+        Validates lease token, fanout run id, and batch existence.
+        Permits re-claim if previous claim has expired or was held by same worker.
+        If actively claimed by another worker, returns 'already_claimed' with bounded retry_after_sec.
+        """
+        with self._lock:
+            self._validate_batch_operation_locked(
+                inspection_id=inspection_id,
+                lease_token=lease_token,
+                fanout_run_id=fanout_run_id,
+                batch_id=batch_id,
+            )
+            fanout = self._fanout_states[inspection_id]
+            batch = fanout.batches[str(batch_id)]
+            now_wall = time.time()
+
+            if batch.state == "committed":
+                return {
+                    "status": "already_committed",
+                    "batch_id": batch_id,
+                    "tile_indices": batch.tile_indices,
+                }
+
+            if batch.state == "claimed":
+                is_expired = (
+                    batch.claim_expires_at is not None
+                    and (now_wall >= batch.claim_expires_at or (batch.claimed_at and now_wall < batch.claimed_at - 5.0))
+                )
+                if not is_expired and batch.claimed_by != worker_name:
+                    rem_sec = max(0.0, batch.claim_expires_at - now_wall)
+                    retry_after = min(10.0, max(3.0, rem_sec / 2.0))
+                    return {
+                        "status": "already_claimed",
+                        "batch_id": batch_id,
+                        "claimed_by": batch.claimed_by,
+                        "claim_expires_at": batch.claim_expires_at,
+                        "retry_after_sec": round(retry_after, 2),
+                    }
+
+            claim_token = uuid.uuid4().hex
+            batch.state = "claimed"
+            batch.claimed_by = worker_name
+            batch.claimed_at = now_wall
+            batch.claim_expires_at = now_wall + claim_timeout_sec
+            batch.claim_token = claim_token
+            batch.claim_attempts += 1
+
+            self._save_fanout_state_locked(fanout)
+            return {
+                "status": "claimed",
+                "batch_id": batch_id,
+                "claim_token": claim_token,
+                "claim_expires_at": batch.claim_expires_at,
+                "tile_indices": batch.tile_indices,
+            }
+
+    def commit_batch(
+        self,
+        inspection_id: str,
+        lease_token: int,
+        worker_name: str,
+        fanout_run_id: str,
+        batch_id: int,
+        claim_token: str,
+        probabilities: List[float],
+    ) -> Dict[str, Any]:
+        """
+        Durably commits batch classification probabilities under lock.
+        Validates claim token, probabilities format/bounds, and writes batch artifact atomically.
+        Transitions fanout to ALL_BATCHES_COMMITTED and CALLBACK_PENDING when all batches are committed.
+        """
+        with self._lock:
+            self._validate_batch_operation_locked(
+                inspection_id=inspection_id,
+                lease_token=lease_token,
+                fanout_run_id=fanout_run_id,
+                batch_id=batch_id,
+            )
+            fanout = self._fanout_states[inspection_id]
+            batch = fanout.batches[str(batch_id)]
+            now_wall = time.time()
+
+            # Input validation
+            if not isinstance(probabilities, list):
+                raise ValueError("probabilities must be a list of floats.")
+            if len(probabilities) != len(batch.tile_indices):
+                raise ValueError(
+                    f"Probabilities count mismatch: expected {len(batch.tile_indices)}, got {len(probabilities)}."
+                )
+            for p in probabilities:
+                if not isinstance(p, (int, float)) or p < 0.0 or p > 1.0 or p != p:
+                    raise ValueError(f"Probability value {p} must be a valid float between 0.0 and 1.0.")
+
+            # Idempotent re-commit
+            if batch.state == "committed":
+                return {
+                    "status": "already_committed",
+                    "batch_id": batch_id,
+                    "committed_batches": fanout.committed_batches,
+                    "fanout_status": fanout.status,
+                }
+
+            if batch.state != "claimed":
+                raise LeaseConflictError(f"Batch {batch_id} is in state '{batch.state}', not claimed.")
+
+            if batch.claim_token != claim_token:
+                raise LeaseConflictError(f"Stale or mismatched claim token for batch {batch_id}.")
+
+            if batch.claim_expires_at and now_wall >= batch.claim_expires_at:
+                raise LeaseConflictError(f"Claim for batch {batch_id} expired at {batch.claim_expires_at}.")
+
+            # Durably write batch file via staging + fsync + os.replace
+            batches_dir = self.storage_dir / inspection_id / "batches"
+            batches_dir.mkdir(parents=True, exist_ok=True)
+            final_batch_file = batches_dir / f"batch_{batch_id:04d}.json"
+            tmp_batch_file = batches_dir / f".batch_{batch_id:04d}_{uuid.uuid4().hex}.tmp"
+            record_payload = {
+                "batch_id": batch_id,
+                "worker_name": worker_name,
+                "claim_token": claim_token,
+                "committed_at": now_wall,
+                "tile_indices": batch.tile_indices,
+                "probabilities": [float(p) for p in probabilities],
+            }
+            with open(tmp_batch_file, "w", encoding="utf-8") as f:
+                json.dump(record_payload, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_batch_file, final_batch_file)
+            try:
+                bdir_fd = os.open(str(batches_dir), os.O_RDONLY)
+                try:
+                    os.fsync(bdir_fd)
+                finally:
+                    os.close(bdir_fd)
+            except Exception:
+                pass
+
+            # Update batch record
+            batch.state = "committed"
+            batch.committed_at = now_wall
+            fanout.committed_batches += 1
+
+            # Check completion of all batches
+            if fanout.committed_batches >= fanout.total_batches:
+                fanout.status = "ALL_BATCHES_COMMITTED"
+                fanout.all_committed_at = now_wall
+                self.write_finalizer_outbox_intent_locked(
+                    inspection_id=inspection_id,
+                    lease_token=lease_token,
+                    fanout_run_id=fanout.fanout_run_id,
+                    generation=0,
+                )
+                fanout.status = "CALLBACK_PENDING"
+                fanout.callback_dispatched_at = now_wall
+
+            self._save_fanout_state_locked(fanout)
+            job = self._jobs[inspection_id]
+            job.fanout_status = fanout.status
+            self._save_job_state(job)
+
+            return {
+                "status": "committed",
+                "batch_id": batch_id,
+                "committed_batches": fanout.committed_batches,
+                "fanout_status": fanout.status,
+            }
+
+    def claim_finalizer(
+        self,
+        inspection_id: str,
+        lease_token: int,
+        worker_name: str,
+        fanout_run_id: str,
+        delegation_duration_sec: float = 30.0,
+    ) -> Dict[str, Any]:
+        """
+        Claims finalizer delegation for post-fanout Stage 5 completion.
+        Returns delegation_token, finalizer_generation, and finalizer_expires_at.
+        """
+        with self._lock:
+            if inspection_id not in self._jobs:
+                raise KeyError(f"Inspection '{inspection_id}' not found.")
+            job = self._jobs[inspection_id]
+            if job.status in ("completed", "failed"):
+                raise LeaseConflictError(f"Job '{inspection_id}' is already in terminal state '{job.status}'.")
+            if job.lease_token != lease_token:
+                raise LeaseConflictError(
+                    f"Fencing lease token mismatch: job lease is {job.lease_token}, but request provided {lease_token}."
+                )
+            fanout = self._fanout_states.get(inspection_id)
+            if not fanout or fanout.lease_token != lease_token or fanout.fanout_run_id != fanout_run_id:
+                raise LeaseConflictError("Active fanout run does not match request credentials.")
+
+            now_wall = time.time()
+            if fanout.status in ("NOT_STARTED", "FANOUT_RUNNING"):
+                raise LeaseConflictError(
+                    f"Cannot claim finalizer in state '{fanout.status}': batches are not yet all committed."
+                )
+            if fanout.status == "TERMINAL":
+                raise LeaseConflictError("Job is already in terminal state.")
+
+            if fanout.status == "FINALIZATION_RUNNING":
+                is_expired = fanout.finalizer_expires_at is not None and now_wall > fanout.finalizer_expires_at
+                if is_expired:
+                    fanout.finalizer_generation += 1
+                elif fanout.finalizer_worker != worker_name:
+                    raise LeaseConflictError(
+                        f"Finalizer delegation is currently held by '{fanout.finalizer_worker}' "
+                        f"until {fanout.finalizer_expires_at}."
+                    )
+            elif fanout.status == "CALLBACK_PENDING":
+                fanout.callback_arrived_at = now_wall
+                fanout.status = "FINALIZATION_RUNNING"
+
+            delegation_token = f"del_{uuid.uuid4().hex}"
+            fanout.delegation_token = delegation_token
+            fanout.finalizer_worker = worker_name
+            fanout.finalizer_claimed_at = now_wall
+            fanout.finalizer_expires_at = now_wall + delegation_duration_sec
+
+            self._save_fanout_state_locked(fanout)
+
+            job.fanout_status = "FINALIZATION_RUNNING"
+            job.delegation_token = delegation_token
+            job.finalizer_worker = worker_name
+            job.finalizer_generation = fanout.finalizer_generation
+            self._save_job_state(job)
+
+            # Durable claim acknowledgement: clean up finalizer outbox intent(s) for this generation
+            self.cleanup_finalizer_outbox(inspection_id, lease_token, fanout.finalizer_generation)
+            if fanout.finalizer_generation > 0:
+                for prev_g in range(fanout.finalizer_generation):
+                    self.cleanup_finalizer_outbox(inspection_id, lease_token, prev_g)
+
+            return {
+                "status": "claimed",
+                "delegation_token": delegation_token,
+                "finalizer_generation": fanout.finalizer_generation,
+                "finalizer_expires_at": fanout.finalizer_expires_at,
+            }
+
+    def apply_finalizer_heartbeat(
+        self,
+        inspection_id: str,
+        lease_token: int,
+        worker_name: str,
+        delegation_token: str,
+        finalizer_generation: int,
+        extension_sec: float = 30.0,
+    ) -> Dict[str, Any]:
+        """
+        Renews finalizer delegation lease window.
+        """
+        with self._lock:
+            self._validate_finalizer_lease_locked(
+                inspection_id=inspection_id,
+                lease_token=lease_token,
+                worker_name=worker_name,
+                delegation_token=delegation_token,
+                finalizer_generation=finalizer_generation,
+            )
+            fanout = self._fanout_states[inspection_id]
+            now_wall = time.time()
+            fanout.finalizer_expires_at = now_wall + extension_sec
+            self._save_fanout_state_locked(fanout)
+            return {
+                "status": "ok",
+                "finalizer_expires_at": fanout.finalizer_expires_at,
+            }
+
+    def get_fanout_status(self, inspection_id: str) -> Optional[FanoutRunState]:
+        """Returns the active fanout run state for an inspection, if any."""
+        with self._lock:
+            return self._fanout_states.get(inspection_id)
+
+    def apply_batch_heartbeat(
+        self,
+        inspection_id: str,
+        lease_token: int,
+        worker_name: str,
+        fanout_run_id: str,
+        batch_id: int,
+        claim_token: str,
+        extension_sec: float = 30.0,
+    ) -> Dict[str, Any]:
+        """
+        Renews an active batch claim window for an authenticated worker under lock.
+        Enforces a hard ceiling of 30.0 seconds.
+        """
+        with self._lock:
+            self._validate_batch_operation_locked(
+                inspection_id=inspection_id,
+                lease_token=lease_token,
+                fanout_run_id=fanout_run_id,
+                batch_id=batch_id,
+            )
+            fanout = self._fanout_states[inspection_id]
+            batch = fanout.batches[str(batch_id)]
+            now_wall = time.time()
+
+            if batch.state != "claimed":
+                raise LeaseConflictError(f"Batch {batch_id} is in state '{batch.state}', not claimed.")
+            if batch.claimed_by != worker_name:
+                raise LeaseConflictError(f"Batch {batch_id} is claimed by '{batch.claimed_by}', not '{worker_name}'.")
+            if batch.claim_token != claim_token:
+                raise LeaseConflictError(f"Stale or mismatched claim token for batch {batch_id}.")
+            if batch.claim_expires_at is not None and now_wall >= batch.claim_expires_at:
+                raise LeaseConflictError(
+                    f"Claim for batch {batch_id} expired at {batch.claim_expires_at} (now {now_wall})."
+                )
+
+            safe_extension = min(30.0, max(1.0, float(extension_sec)))
+            batch.claim_expires_at = now_wall + safe_extension
+            self._save_fanout_state_locked(fanout)
+            return {
+                "status": "ok",
+                "batch_id": batch_id,
+                "claim_expires_at": batch.claim_expires_at,
+            }
+
+    def get_committed_batches_locked(
+        self,
+        inspection_id: str,
+        lease_token: int,
+        worker_name: str,
+        delegation_token: str,
+        finalizer_generation: int,
+    ) -> Dict[str, Any]:
+        """
+        Retrieves committed batch classification results for delegated finalizer.
+        Validates finalizer lease, generation, completeness, and value bounds.
+        """
+        with self._lock:
+            self._validate_finalizer_lease_locked(
+                inspection_id=inspection_id,
+                lease_token=lease_token,
+                worker_name=worker_name,
+                delegation_token=delegation_token,
+                finalizer_generation=finalizer_generation,
+            )
+            fanout = self._fanout_states[inspection_id]
+            if fanout.committed_batches < fanout.total_batches:
+                raise LeaseConflictError(
+                    f"Cannot retrieve committed batches: only {fanout.committed_batches}/{fanout.total_batches} committed."
+                )
+
+            batches_dir = self.storage_dir / inspection_id / "batches"
+            results = []
+            for b_idx in range(fanout.total_batches):
+                b_str = str(b_idx)
+                if b_str not in fanout.batches:
+                    raise KeyError(f"Batch {b_idx} missing in fanout definition.")
+                batch_rec = fanout.batches[b_str]
+                if batch_rec.state != "committed":
+                    raise LeaseConflictError(f"Batch {b_idx} is not in committed state.")
+
+                batch_file = batches_dir / f"batch_{b_idx:04d}.json"
+                if not batch_file.exists():
+                    raise FileNotFoundError(f"Missing durable batch file: {batch_file.name}")
+
+                with open(batch_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+
+                if data.get("batch_id") != b_idx:
+                    raise ValueError(f"Corrupt batch file {batch_file.name}: batch_id mismatch.")
+                probs = data.get("probabilities", [])
+                tile_indices = data.get("tile_indices", [])
+                if len(probs) != len(tile_indices):
+                    raise ValueError(f"Corrupt batch file {batch_file.name}: probabilities count mismatch.")
+                for p in probs:
+                    if not isinstance(p, (int, float)) or p < 0.0 or p > 1.0 or p != p:
+                        raise ValueError(f"Corrupt batch file {batch_file.name}: invalid probability value {p}.")
+
+                results.append({
+                    "batch_id": b_idx,
+                    "tile_indices": tile_indices,
+                    "probabilities": [float(p) for p in probs],
+                })
+
+            return {
+                "inspection_id": inspection_id,
+                "fanout_run_id": fanout.fanout_run_id,
+                "total_batches": fanout.total_batches,
+                "committed_batches": fanout.committed_batches,
+                "batches": results,
+            }
 
     def create_job(
         self,

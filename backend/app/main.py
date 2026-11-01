@@ -17,17 +17,20 @@ from . import settings
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1. Startup: Reconcile crash-safe outbox
+    # 1. Startup: Acquire single-master advisory storage lock
+    job_manager.acquire_storage_lock()
+
+    # 2. Reconcile crash-safe outbox
     job_manager.reconcile_outbox_on_startup()
 
-    # 2. Start recovery supervisor background task in celery mode
+    # 3. Start recovery supervisor background task in celery mode
     supervisor_task = None
     if settings.get_execution_mode() == "celery":
         supervisor_task = asyncio.create_task(recovery_supervisor.run_loop())
 
     yield
 
-    # 3. Shutdown: Cleanly stop supervisor task
+    # 4. Shutdown: Cleanly stop supervisor task
     if supervisor_task:
         recovery_supervisor.stop()
         supervisor_task.cancel()
@@ -35,6 +38,9 @@ async def lifespan(app: FastAPI):
             await supervisor_task
         except asyncio.CancelledError:
             pass
+
+    # 5. Release single-master advisory storage lock
+    job_manager.release_storage_lock()
 
 
 app = FastAPI(

@@ -12,6 +12,57 @@ from .calibration import CalibrationSummary
 PipelineStatus = Literal["waiting", "active", "completed", "failed"]
 InspectionStatus = Literal["queued", "processing", "completed", "failed"]
 FindingType = Literal["potential_crack", "surface_irregularity", "minor_anomaly"]
+FanoutStatus = Literal[
+    "NOT_STARTED",
+    "FANOUT_RUNNING",
+    "ALL_BATCHES_COMMITTED",
+    "CALLBACK_PENDING",
+    "FINALIZATION_RUNNING",
+    "TERMINAL",
+]
+BatchClaimState = Literal["pending", "claimed", "committed"]
+
+
+class BatchDefinition(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    batch_id: int
+    tile_indices: List[int]
+    tiles_count: int
+
+
+class BatchRecord(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    batch_id: int
+    tile_indices: List[int]
+    state: BatchClaimState = "pending"
+    claimed_by: Optional[str] = None
+    claimed_at: Optional[float] = None
+    claim_expires_at: Optional[float] = None
+    claim_token: Optional[str] = None
+    claim_attempts: int = 0
+    committed_at: Optional[float] = None
+
+
+class FanoutRunState(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    inspection_id: str
+    fanout_run_id: str
+    lease_token: int
+    status: FanoutStatus = "NOT_STARTED"
+    total_batches: int = 0
+    committed_batches: int = 0
+    batches: Dict[str, BatchRecord] = Field(default_factory=dict)
+    created_at: float = Field(default_factory=lambda: datetime.now(timezone.utc).timestamp())
+    all_committed_at: Optional[float] = None
+    callback_dispatched_at: Optional[float] = None
+    callback_arrived_at: Optional[float] = None
+    delegation_token: Optional[str] = None
+    finalizer_worker: Optional[str] = None
+    finalizer_generation: int = 0
+    finalizer_claimed_at: Optional[float] = None
+    finalizer_expires_at: Optional[float] = None
+    finalized_at: Optional[float] = None
+    failure_reason: Optional[str] = None
 
 
 DEFAULT_STAGES = [
@@ -111,6 +162,11 @@ class InspectionResponse(BaseModel):
     assigned_worker: Optional[str] = None
     last_heartbeat_at: Optional[float] = None
     recovery_pending: bool = False
+    fanout_status: Optional[FanoutStatus] = None
+    fanout_run_id: Optional[str] = None
+    delegation_token: Optional[str] = None
+    finalizer_worker: Optional[str] = None
+    finalizer_generation: Optional[int] = None
 
     @classmethod
     def create_initial(

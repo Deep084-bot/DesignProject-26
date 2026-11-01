@@ -12,6 +12,7 @@ Orchestrates sequential pipeline stages:
 Reports authentic progress and explicit errors without simulated timers.
 """
 
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional, Dict, Any, List
 import os
@@ -27,12 +28,43 @@ from .depth import reconstruct_3d_points
 from .ply_writer import write_ply
 from .mesh_reconstruction import reconstruct_surface_mesh
 from .deviations import analyze_deviations, compute_surface_deviations, DeviationRegion
-from .damage import detect_damage
+from .damage import detect_damage, DamageDetectionResult
 from ..models.calibration import StereoCalibration
 from ..models.inspection import Finding
 
 
 ProgressCallback = Callable[[int, str, str, Optional[str]], None]
+
+
+@dataclass
+class Stage0to3Result:
+    """
+    Partial execution result containing all outputs and metadata from Stages 0 to 3.
+    Enables distributed Stage 4 execution without repeating Stages 0-3.
+    """
+    success: bool
+    duration_sec: float
+    start_time: float
+    failure_message: Optional[str] = None
+    failed_stage_index: Optional[int] = None
+    point_count: int = 0
+    point_cloud_path: Optional[Path] = None
+    mesh_path: Optional[Path] = None
+    triangle_count: Optional[int] = None
+    mesh_status: Optional[str] = None
+    mesh_error: Optional[str] = None
+    disparity_path: Optional[Path] = None
+    disparity_vis_path: Optional[Path] = None
+    rectified_left_path: Optional[Path] = None
+    rectified_right_path: Optional[Path] = None
+    deviation_map_path: Optional[Path] = None
+    deviation_heatmap_path: Optional[Path] = None
+    deviations_json_path: Optional[Path] = None
+    deviation_regions: List[Any] = field(default_factory=list)
+    deviation_summary: Optional[Dict[str, Any]] = None
+    rectified_left: Optional[np.ndarray] = None
+    disparity: Optional[np.ndarray] = None
+    intrinsics: Optional[Dict[str, float]] = None
 
 
 class PipelineExecutionResult:
@@ -85,25 +117,22 @@ class PipelineExecutionResult:
         self.failed_stage_index = failed_stage_index
 
 
-def run_pipeline(
+def run_pipeline_stages_0_to_3(
     job_dir: Path,
     left_image_path: Path,
     right_image_path: Path,
     calibration: StereoCalibration,
     on_step_change: Optional[ProgressCallback] = None,
-) -> PipelineExecutionResult:
+) -> Stage0to3Result:
     """
-    Executes the stereo processing pipeline synchronously.
-
-    Args:
-        job_dir: Working directory for artifacts.
-        left_image_path: Path to stored left image file.
-        right_image_path: Path to stored right image file.
-        calibration: Verified StereoCalibration object.
-        on_step_change: Callback invoked as (step_index, step_id, status, error_msg).
+    Executes Stages 0 to 3 of the stereo reconstruction pipeline synchronously:
+    0. prepare: Decodes images, validates stereo dimensions, performs epipolar rectification.
+    1. depth: Computes StereoSGBM sub-pixel disparity map and visualization.
+    2. surface: Triangulates 3D physical coordinates, writes PLY point cloud, and reconstructs Poisson mesh.
+    3. deviations: Fits robust reference plane and detects out-of-plane geometric deviation regions.
 
     Returns:
-        PipelineExecutionResult with execution details and artifact paths.
+        Stage0to3Result containing all intermediate artifacts, metrics, and memory representations.
     """
     start_time = time.perf_counter()
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -136,9 +165,10 @@ def run_pipeline(
     except Exception as e:
         err_msg = str(e)
         report(0, "prepare", "failed", err_msg)
-        return PipelineExecutionResult(
+        return Stage0to3Result(
             success=False,
             duration_sec=round(time.perf_counter() - start_time, 2),
+            start_time=start_time,
             failure_message=err_msg,
             failed_stage_index=0,
         )
@@ -163,9 +193,10 @@ def run_pipeline(
     except Exception as e:
         err_msg = str(e)
         report(1, "depth", "failed", err_msg)
-        return PipelineExecutionResult(
+        return Stage0to3Result(
             success=False,
             duration_sec=round(time.perf_counter() - start_time, 2),
+            start_time=start_time,
             failure_message=err_msg,
             failed_stage_index=1,
         )
@@ -231,9 +262,10 @@ def run_pipeline(
     except Exception as e:
         err_msg = str(e)
         report(2, "surface", "failed", err_msg)
-        return PipelineExecutionResult(
+        return Stage0to3Result(
             success=False,
             duration_sec=round(time.perf_counter() - start_time, 2),
+            start_time=start_time,
             failure_message=err_msg,
             failed_stage_index=2,
         )
@@ -242,11 +274,6 @@ def run_pipeline(
     # Stage 3: deviations (Dense geometric deviation analysis)
     # ---------------------------------------------------------
     report(3, "deviations", "active")
-    deviation_map_path: Optional[Path] = None
-    deviation_heatmap_path: Optional[Path] = None
-    deviation_regions: list = []
-    deviation_summary: Optional[Dict[str, Any]] = None
-
     dev_k = float(os.environ.get("SURFACE_DEV_K", "3.0"))
     dev_min_mm = float(os.environ.get("SURFACE_DEV_MIN_MM", "5.0"))
     dev_min_area_px = int(os.environ.get("SURFACE_DEV_MIN_AREA_PX", "200"))
@@ -277,32 +304,17 @@ def run_pipeline(
                 "regions": [dict(r) for r in dev_res.regions],
             }, f, indent=2)
 
-        deviation_map_path = dev_map_file
-        deviation_heatmap_path = dev_heatmap_file
-        deviation_regions = dev_res.regions
-        deviation_summary = dev_res.summary
-
         report(3, "deviations", "completed")
     except Exception as e:
         err_msg = str(e)
         report(3, "deviations", "failed", err_msg)
-        return PipelineExecutionResult(
+        return Stage0to3Result(
             success=False,
             duration_sec=round(time.perf_counter() - start_time, 2),
+            start_time=start_time,
             failure_message=err_msg,
             failed_stage_index=3,
         )
-
-    # ---------------------------------------------------------
-    # Stage 4: damage (Visual crack classification & finding correlation)
-    # ---------------------------------------------------------
-    report(4, "damage", "active")
-    findings: List[Finding] = []
-    classifier_status: Optional[str] = None
-    classifier_error: Optional[str] = None
-
-    tile_size = int(os.environ.get("SURFACE_TILE_SIZE", "256"))
-    crack_threshold = float(os.environ.get("SURFACE_CRACK_THRESHOLD", "0.5"))
 
     intrinsics = {
         "fx": rect_params.fx,
@@ -312,39 +324,10 @@ def run_pipeline(
         "baseline_mm": rect_params.baseline_mm,
     }
 
-    try:
-        damage_res = detect_damage(
-            rectified_left_bgr=rect_params.rectified_left,
-            deviation_regions=deviation_regions,
-            disparity=disparity_float,
-            intrinsics=intrinsics,
-            tile=tile_size,
-            threshold=crack_threshold,
-            job_dir=job_dir,
-        )
-        findings = damage_res.findings
-        classifier_status = damage_res.classifier_status
-        classifier_error = damage_res.classifier_error
-        report(4, "damage", "completed")
-    except Exception as e:
-        err_msg = str(e)
-        report(4, "damage", "failed", err_msg)
-        return PipelineExecutionResult(
-            success=False,
-            duration_sec=round(time.perf_counter() - start_time, 2),
-            failure_message=err_msg,
-            failed_stage_index=4,
-        )
-
-    # ---------------------------------------------------------
-    # Stage 5: results (Wrap-up)
-    # ---------------------------------------------------------
-    report(5, "results", "active")
-    duration = round(time.perf_counter() - start_time, 2)
-    report(5, "results", "completed")
-
-    return PipelineExecutionResult(
+    return Stage0to3Result(
         success=True,
+        duration_sec=round(time.perf_counter() - start_time, 2),
+        start_time=start_time,
         point_count=pt_cloud.valid_count,
         point_cloud_path=ply_path,
         mesh_path=mesh_path,
@@ -355,12 +338,125 @@ def run_pipeline(
         disparity_vis_path=disp_vis_path,
         rectified_left_path=rect_left_path,
         rectified_right_path=rect_right_path,
-        deviation_map_path=deviation_map_path,
-        deviation_heatmap_path=deviation_heatmap_path,
-        deviation_regions=deviation_regions,
-        deviation_summary=deviation_summary,
-        findings=findings,
-        classifier_status=classifier_status,
-        classifier_error=classifier_error,
+        deviation_map_path=dev_map_file,
+        deviation_heatmap_path=dev_heatmap_file,
+        deviations_json_path=deviations_json_file,
+        deviation_summary=dev_res.summary,
+        deviation_regions=dev_res.regions,
+        rectified_left=rect_params.rectified_left,
+        disparity=disparity_float,
+        intrinsics=intrinsics,
+    )
+
+
+def run_pipeline_stage_5(
+    job_dir: Path,
+    stage_0_3_result: Stage0to3Result,
+    damage_result: DamageDetectionResult,
+    on_step_change: Optional[ProgressCallback] = None,
+) -> PipelineExecutionResult:
+    """
+    Executes Stage 5 (results wrap-up) packaging timing metadata, findings,
+    and artifact references into a complete PipelineExecutionResult.
+    """
+    def report(idx: int, step_id: str, status: str, msg: Optional[str] = None):
+        if on_step_change:
+            on_step_change(idx, step_id, status, msg)
+
+    # ---------------------------------------------------------
+    # Stage 5: results (Wrap-up)
+    # ---------------------------------------------------------
+    report(5, "results", "active")
+    duration = round(time.perf_counter() - stage_0_3_result.start_time, 2)
+    report(5, "results", "completed")
+
+    return PipelineExecutionResult(
+        success=True,
+        point_count=stage_0_3_result.point_count,
+        point_cloud_path=stage_0_3_result.point_cloud_path,
+        mesh_path=stage_0_3_result.mesh_path,
+        triangle_count=stage_0_3_result.triangle_count,
+        mesh_status=stage_0_3_result.mesh_status,
+        mesh_error=stage_0_3_result.mesh_error,
+        disparity_path=stage_0_3_result.disparity_path,
+        disparity_vis_path=stage_0_3_result.disparity_vis_path,
+        rectified_left_path=stage_0_3_result.rectified_left_path,
+        rectified_right_path=stage_0_3_result.rectified_right_path,
+        deviation_map_path=stage_0_3_result.deviation_map_path,
+        deviation_heatmap_path=stage_0_3_result.deviation_heatmap_path,
+        deviation_regions=stage_0_3_result.deviation_regions,
+        deviation_summary=stage_0_3_result.deviation_summary,
+        findings=damage_result.findings,
+        classifier_status=damage_result.classifier_status,
+        classifier_error=damage_result.classifier_error,
         duration_sec=duration,
+    )
+
+
+def run_pipeline(
+    job_dir: Path,
+    left_image_path: Path,
+    right_image_path: Path,
+    calibration: StereoCalibration,
+    on_step_change: Optional[ProgressCallback] = None,
+) -> PipelineExecutionResult:
+    """
+    Executes the stereo processing pipeline synchronously end-to-end (Stages 0 to 5).
+    Retained as the public entry point preserving existing local execution behavior.
+    """
+    stage_0_3 = run_pipeline_stages_0_to_3(
+        job_dir=job_dir,
+        left_image_path=left_image_path,
+        right_image_path=right_image_path,
+        calibration=calibration,
+        on_step_change=on_step_change,
+    )
+    if not stage_0_3.success:
+        return PipelineExecutionResult(
+            success=False,
+            duration_sec=stage_0_3.duration_sec,
+            failure_message=stage_0_3.failure_message,
+            failed_stage_index=stage_0_3.failed_stage_index,
+        )
+
+    # ---------------------------------------------------------
+    # Stage 4: damage (Visual crack classification & finding correlation)
+    # ---------------------------------------------------------
+    def report(idx: int, step_id: str, status: str, msg: Optional[str] = None):
+        if on_step_change:
+            on_step_change(idx, step_id, status, msg)
+
+    report(4, "damage", "active")
+    tile_size = int(os.environ.get("SURFACE_TILE_SIZE", "256"))
+    crack_threshold = float(os.environ.get("SURFACE_CRACK_THRESHOLD", "0.5"))
+
+    try:
+        damage_res = detect_damage(
+            rectified_left_bgr=stage_0_3.rectified_left,
+            deviation_regions=stage_0_3.deviation_regions,
+            disparity=stage_0_3.disparity,
+            intrinsics=stage_0_3.intrinsics,
+            tile=tile_size,
+            threshold=crack_threshold,
+            job_dir=job_dir,
+        )
+        report(4, "damage", "completed")
+    except Exception as e:
+        err_msg = str(e)
+        report(4, "damage", "failed", err_msg)
+        return PipelineExecutionResult(
+            success=False,
+            duration_sec=round(time.perf_counter() - stage_0_3.start_time, 2),
+            failure_message=err_msg,
+            failed_stage_index=4,
+        )
+
+    # ---------------------------------------------------------
+    # Stage 5: results (Wrap-up)
+    # ---------------------------------------------------------
+    return run_pipeline_stage_5(
+        job_dir=job_dir,
+        stage_0_3_result=stage_0_3,
+        damage_result=damage_res,
+        on_step_change=on_step_change,
     )

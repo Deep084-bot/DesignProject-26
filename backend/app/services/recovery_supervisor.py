@@ -66,6 +66,135 @@ class RecoverySupervisor:
                 self._grace_periods.pop(job.id, None)
                 continue
 
+            fanout = self.job_manager.get_fanout_status(job.id)
+            if fanout and fanout.status in (
+                "FANOUT_RUNNING",
+                "ALL_BATCHES_COMMITTED",
+                "CALLBACK_PENDING",
+                "FINALIZATION_RUNNING",
+            ):
+                self._grace_periods.pop(job.id, None)
+                now_wall = time.time()
+
+                if fanout.status == "FANOUT_RUNNING":
+                    # Decoupled from coordinator: coordinator loss does NOT trigger M4a lease increments
+                    for batch in list(fanout.batches.values()):
+                        if batch.state == "claimed" and batch.claim_expires_at:
+                            if now_wall >= batch.claim_expires_at or (batch.claimed_at and now_wall < batch.claimed_at - 5.0):
+                                logger.info(
+                                    f"Batch {batch.batch_id} claim by '{batch.claimed_by}' for job {job.id} "
+                                    f"expired at {batch.claim_expires_at}. Resetting to pending and writing outbox intent."
+                                )
+                                self.job_manager.write_batch_outbox_intent_locked(
+                                    inspection_id=job.id,
+                                    lease_token=job.lease_token,
+                                    fanout_run_id=fanout.fanout_run_id,
+                                    batch_id=batch.batch_id,
+                                    reason=f"Batch claim by '{batch.claimed_by}' expired",
+                                )
+                                batch.state = "pending"
+                                batch.claimed_by = None
+                                batch.claim_token = None
+                                batch.claim_expires_at = None
+                                self.job_manager._save_fanout_state_locked(fanout)
+
+                                try:
+                                    from ..tasks import classify_batch_task
+                                    classify_batch_task.delay(
+                                        job.id, job.lease_token, fanout.fanout_run_id, batch.batch_id
+                                    )
+                                    self.job_manager.cleanup_batch_outbox(
+                                        job.id, job.lease_token, fanout.fanout_run_id, batch.batch_id
+                                    )
+                                    logger.info(f"Redispatched expired batch {batch.batch_id} for job {job.id}.")
+                                except Exception as exc:
+                                    logger.error(f"Failed to redispatch batch {batch.batch_id} for job {job.id}: {exc}")
+                    continue
+
+                elif fanout.status == "ALL_BATCHES_COMMITTED":
+                    self.job_manager.write_finalizer_outbox_intent_locked(
+                        inspection_id=job.id,
+                        lease_token=job.lease_token,
+                        fanout_run_id=fanout.fanout_run_id,
+                        generation=0,
+                    )
+                    fanout.status = "CALLBACK_PENDING"
+                    fanout.callback_dispatched_at = now_wall
+                    self.job_manager._save_fanout_state_locked(fanout)
+                    job.fanout_status = "CALLBACK_PENDING"
+                    self.job_manager._save_job_state(job)
+                    continue
+
+                elif fanout.status == "CALLBACK_PENDING":
+                    if fanout.callback_dispatched_at and (now_wall - fanout.callback_dispatched_at) > 30.0:
+                        logger.warning(
+                            f"Job {job.id} chord callback arrival exceeded 30s deadline "
+                            f"(elapsed {now_wall - fanout.callback_dispatched_at:.1f}s). Rescheduling finalizer intent."
+                        )
+                        self.job_manager.write_finalizer_outbox_intent_locked(
+                            inspection_id=job.id,
+                            lease_token=job.lease_token,
+                            fanout_run_id=fanout.fanout_run_id,
+                            generation=fanout.finalizer_generation,
+                        )
+                        fanout.callback_dispatched_at = now_wall
+                        self.job_manager._save_fanout_state_locked(fanout)
+
+                        if settings.get_execution_mode() == "celery":
+                            try:
+                                from ..tasks import finalize_inspection_task
+                                finalize_inspection_task.delay(job.id, job.lease_token, fanout.fanout_run_id)
+                                self.job_manager.mark_finalizer_outbox_published(
+                                    job.id, job.lease_token, fanout.finalizer_generation
+                                )
+                                logger.info(f"Published recovered finalizer task for job {job.id}.")
+                            except Exception as exc:
+                                logger.error(f"Failed to publish recovered finalizer task for job {job.id}: {exc}")
+                    continue
+
+                elif fanout.status == "FINALIZATION_RUNNING":
+                    if fanout.finalizer_expires_at and now_wall > fanout.finalizer_expires_at:
+                        new_gen = fanout.finalizer_generation + 1
+                        logger.warning(
+                            f"Job {job.id} finalizer delegation for '{fanout.finalizer_worker}' expired. "
+                            f"Initiating generation takeover {fanout.finalizer_generation} -> {new_gen}."
+                        )
+
+                        # 1. Write-Ahead Log: Durably persist new-generation outbox intent FIRST before committing state transition
+                        self.job_manager.write_finalizer_outbox_intent_locked(
+                            inspection_id=job.id,
+                            lease_token=job.lease_token,
+                            fanout_run_id=fanout.fanout_run_id,
+                            generation=new_gen,
+                        )
+
+                        # 2. Durably commit new generation and CALLBACK_PENDING transition in fanout_state.json
+                        fanout.delegation_token = None
+                        fanout.finalizer_worker = None
+                        fanout.finalizer_generation = new_gen
+                        fanout.status = "CALLBACK_PENDING"
+                        fanout.callback_dispatched_at = now_wall
+                        self.job_manager._save_fanout_state_locked(fanout)
+
+                        # 3. Synchronize inspection.json from authoritative fanout state
+                        job.fanout_status = "CALLBACK_PENDING"
+                        job.delegation_token = None
+                        job.finalizer_worker = None
+                        job.finalizer_generation = new_gen
+                        self.job_manager._save_job_state(job)
+
+                        if settings.get_execution_mode() == "celery":
+                            try:
+                                from ..tasks import finalize_inspection_task
+                                finalize_inspection_task.delay(job.id, job.lease_token, fanout.fanout_run_id)
+                                self.job_manager.mark_finalizer_outbox_published(
+                                    job.id, job.lease_token, new_gen
+                                )
+                                logger.info(f"Published takeover finalizer task for job {job.id} (gen {new_gen}).")
+                            except Exception as exc:
+                                logger.error(f"Failed to publish takeover finalizer for job {job.id} (gen {new_gen}): {exc}")
+                    continue
+
             if not job.assigned_worker:
                 # Job has not been claimed by a worker yet
                 self._grace_periods.pop(job.id, None)

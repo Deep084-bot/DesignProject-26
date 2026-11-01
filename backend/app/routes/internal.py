@@ -106,6 +106,64 @@ class FailJobRequest(BaseModel):
     worker: Optional[str] = None
 
 
+class BatchInitItem(BaseModel):
+    batch_id: int
+    tile_indices: List[int]
+    tiles_count: Optional[int] = None
+
+
+class FanoutInitRequest(BaseModel):
+    total_batches: int
+    batches: List[BatchInitItem]
+
+
+class BatchClaimRequest(BaseModel):
+    fanout_run_id: str
+    claim_timeout_sec: float = 30.0
+
+
+class BatchHeartbeatRequest(BaseModel):
+    fanout_run_id: str
+    claim_token: str
+    extension_sec: float = Field(
+        default=30.0,
+        ge=1.0,
+        le=30.0,
+        description="Lease extension duration in seconds (capped at 30.0s).",
+    )
+
+
+class BatchCommittedItem(BaseModel):
+    batch_id: int
+    tile_indices: List[int]
+    probabilities: List[float]
+
+
+class CommittedBatchesResponse(BaseModel):
+    inspection_id: str
+    fanout_run_id: str
+    total_batches: int
+    committed_batches: int
+    batches: List[BatchCommittedItem]
+
+
+class BatchCommitRequest(BaseModel):
+    fanout_run_id: str
+    claim_token: str
+    probabilities: List[float]
+
+
+class FinalizerClaimRequest(BaseModel):
+    fanout_run_id: str
+    delegation_duration_sec: float = 30.0
+
+
+class FinalizerHeartbeatRequest(BaseModel):
+    delegation_token: str
+    finalizer_generation: int
+    extension_sec: float = 30.0
+
+
 @router.get("/jobs/{inspection_id}/manifest")
 async def get_job_manifest(
     inspection_id: str,
@@ -197,12 +255,26 @@ async def post_job_heartbeat(
     }
 
 
+def _parse_generation(x_gen: Optional[str]) -> Optional[int]:
+    if x_gen is None:
+        return None
+    try:
+        return int(x_gen)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Invalid 'X-Finalizer-Generation' value '{x_gen}': must be an integer.",
+        )
+
+
 @router.post("/jobs/{inspection_id}/artifacts/{artifact_name:path}")
 async def upload_job_artifact(
     inspection_id: str,
     artifact_name: str,
     file: UploadFile = File(...),
     fencing: Tuple[int, str] = Depends(verify_fencing_headers),
+    x_delegation_token: Optional[str] = Header(None, alias="X-Delegation-Token"),
+    x_finalizer_generation: Optional[str] = Header(None, alias="X-Finalizer-Generation"),
 ):
     """
     Receives an artifact file from a worker and commits it safely using two-phase atomic replacement.
@@ -210,6 +282,7 @@ async def upload_job_artifact(
     replaces the target file inside the lock boundary.
     """
     lease_token, worker_name = fencing
+    finalizer_gen = _parse_generation(x_finalizer_generation)
 
     if (
         not artifact_name
@@ -256,6 +329,8 @@ async def upload_job_artifact(
             worker_name=worker_name,
             artifact_name=artifact_name,
             staging_path=staging_path,
+            delegation_token=x_delegation_token,
+            finalizer_generation=finalizer_gen,
         )
     except KeyError:
         staging_path.unlink(missing_ok=True)
@@ -286,12 +361,15 @@ async def update_job_step(
     inspection_id: str,
     payload: StepUpdateRequest,
     fencing: Tuple[int, str] = Depends(verify_fencing_headers),
+    x_delegation_token: Optional[str] = Header(None, alias="X-Delegation-Token"),
+    x_finalizer_generation: Optional[str] = Header(None, alias="X-Finalizer-Generation"),
 ):
     """
     Applies a pipeline step progress update from a worker under lease validation.
     Returns 409 Conflict if lease is expired or mismatched.
     """
     lease_token, worker_name = fencing
+    finalizer_gen = _parse_generation(x_finalizer_generation)
 
     job = job_manager.get_job(inspection_id)
     if not job:
@@ -310,6 +388,8 @@ async def update_job_step(
             duration_sec=payload.duration_sec,
             message=payload.message,
             lease_token=lease_token,
+            delegation_token=x_delegation_token,
+            finalizer_generation=finalizer_gen,
         )
     except LeaseConflictError as err:
         raise HTTPException(
@@ -325,12 +405,15 @@ async def complete_job(
     inspection_id: str,
     payload: CompleteJobRequest,
     fencing: Tuple[int, str] = Depends(verify_fencing_headers),
+    x_delegation_token: Optional[str] = Header(None, alias="X-Delegation-Token"),
+    x_finalizer_generation: Optional[str] = Header(None, alias="X-Finalizer-Generation"),
 ):
     """
     Applies final successful results from a worker under lease validation.
     Returns 409 Conflict if lease is expired or mismatched.
     """
     lease_token, worker_name = fencing
+    finalizer_gen = _parse_generation(x_finalizer_generation)
 
     job = job_manager.get_job(inspection_id)
     if not job:
@@ -353,6 +436,8 @@ async def complete_job(
             duration_sec=payload.duration_sec,
             worker=payload.worker or worker_name,
             lease_token=lease_token,
+            delegation_token=x_delegation_token,
+            finalizer_generation=finalizer_gen,
         )
     except LeaseConflictError as err:
         raise HTTPException(
@@ -368,12 +453,15 @@ async def fail_job(
     inspection_id: str,
     payload: FailJobRequest,
     fencing: Tuple[int, str] = Depends(verify_fencing_headers),
+    x_delegation_token: Optional[str] = Header(None, alias="X-Delegation-Token"),
+    x_finalizer_generation: Optional[str] = Header(None, alias="X-Finalizer-Generation"),
 ):
     """
     Applies failure status and error details from a worker under lease validation.
     Returns 409 Conflict if lease is expired or mismatched.
     """
     lease_token, worker_name = fencing
+    finalizer_gen = _parse_generation(x_finalizer_generation)
 
     job = job_manager.get_job(inspection_id)
     if not job:
@@ -389,6 +477,8 @@ async def fail_job(
             failed_stage_index=payload.failed_stage_index,
             worker=payload.worker or worker_name,
             lease_token=lease_token,
+            delegation_token=x_delegation_token,
+            finalizer_generation=finalizer_gen,
         )
     except LeaseConflictError as err:
         raise HTTPException(
@@ -397,3 +487,267 @@ async def fail_job(
         )
 
     return {"status": "ok" if applied else "ignored"}
+
+
+@router.post("/jobs/{inspection_id}/fanout/init")
+async def init_fanout_run(
+    inspection_id: str,
+    payload: FanoutInitRequest,
+    fencing: Tuple[int, str] = Depends(verify_fencing_headers),
+):
+    """
+    Initializes a fan-out run for Stage 4 under coordinator lease validation.
+    """
+    lease_token, worker_name = fencing
+    try:
+        fanout = job_manager.init_fanout(
+            inspection_id=inspection_id,
+            lease_token=lease_token,
+            worker_name=worker_name,
+            total_batches=payload.total_batches,
+            batches=payload.batches,
+        )
+    except KeyError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Inspection '{inspection_id}' not found.",
+        )
+    except LeaseConflictError as err:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(err),
+        )
+
+    return fanout
+
+
+@router.post("/jobs/{inspection_id}/batches/{batch_id}/claim")
+async def claim_inspection_batch(
+    inspection_id: str,
+    batch_id: int,
+    payload: BatchClaimRequest,
+    fencing: Tuple[int, str] = Depends(verify_fencing_headers),
+):
+    """
+    Claims a batch for processing by an authenticated cluster worker.
+    """
+    lease_token, worker_name = fencing
+    try:
+        result = job_manager.claim_batch(
+            inspection_id=inspection_id,
+            lease_token=lease_token,
+            worker_name=worker_name,
+            fanout_run_id=payload.fanout_run_id,
+            batch_id=batch_id,
+            claim_timeout_sec=payload.claim_timeout_sec,
+        )
+    except KeyError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Inspection '{inspection_id}' or batch '{batch_id}' not found.",
+        )
+    except LeaseConflictError as err:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(err),
+        )
+
+    return result
+
+
+@router.post("/jobs/{inspection_id}/batches/{batch_id}/commit")
+async def commit_inspection_batch(
+    inspection_id: str,
+    batch_id: int,
+    payload: BatchCommitRequest,
+    fencing: Tuple[int, str] = Depends(verify_fencing_headers),
+):
+    """
+    Durably commits batch probabilities under lock and atomic persistence.
+    """
+    lease_token, worker_name = fencing
+    try:
+        result = job_manager.commit_batch(
+            inspection_id=inspection_id,
+            lease_token=lease_token,
+            worker_name=worker_name,
+            fanout_run_id=payload.fanout_run_id,
+            batch_id=batch_id,
+            claim_token=payload.claim_token,
+            probabilities=payload.probabilities,
+        )
+    except KeyError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Inspection '{inspection_id}' or batch '{batch_id}' not found.",
+        )
+    except ValueError as val_err:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(val_err),
+        )
+    except LeaseConflictError as err:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(err),
+        )
+
+    return result
+
+
+@router.post("/jobs/{inspection_id}/batches/{batch_id}/heartbeat")
+async def post_batch_heartbeat(
+    inspection_id: str,
+    batch_id: int,
+    payload: BatchHeartbeatRequest,
+    fencing: Tuple[int, str] = Depends(verify_fencing_headers),
+):
+    """
+    Renews an active batch claim window for an authenticated worker.
+    """
+    lease_token, worker_name = fencing
+    try:
+        result = job_manager.apply_batch_heartbeat(
+            inspection_id=inspection_id,
+            lease_token=lease_token,
+            worker_name=worker_name,
+            fanout_run_id=payload.fanout_run_id,
+            batch_id=batch_id,
+            claim_token=payload.claim_token,
+            extension_sec=payload.extension_sec,
+        )
+    except KeyError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Inspection '{inspection_id}' or batch '{batch_id}' not found.",
+        )
+    except LeaseConflictError as err:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(err),
+        )
+
+    return result
+
+
+@router.get("/jobs/{inspection_id}/batches/committed", response_model=CommittedBatchesResponse)
+async def get_committed_batches(
+    inspection_id: str,
+    fencing: Tuple[int, str] = Depends(verify_fencing_headers),
+    x_delegation_token: Optional[str] = Header(None, alias="X-Delegation-Token"),
+    x_finalizer_generation: Optional[str] = Header(None, alias="X-Finalizer-Generation"),
+):
+    """
+    Retrieves authoritative committed batch results for delegated finalizer.
+    """
+    lease_token, worker_name = fencing
+    finalizer_gen = _parse_generation(x_finalizer_generation)
+    if not x_delegation_token or finalizer_gen is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Committed batches retrieval requires 'X-Delegation-Token' and 'X-Finalizer-Generation'.",
+        )
+    try:
+        result = job_manager.get_committed_batches_locked(
+            inspection_id=inspection_id,
+            lease_token=lease_token,
+            worker_name=worker_name,
+            delegation_token=x_delegation_token,
+            finalizer_generation=finalizer_gen,
+        )
+    except KeyError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Inspection '{inspection_id}' not found.",
+        )
+    except LeaseConflictError as err:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(err),
+        )
+    except Exception as err:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve committed batches: {err}",
+        )
+
+    return result
+
+
+@router.post("/jobs/{inspection_id}/finalizer/claim")
+async def claim_finalizer_delegation(
+    inspection_id: str,
+    payload: FinalizerClaimRequest,
+    fencing: Tuple[int, str] = Depends(verify_fencing_headers),
+):
+    """
+    Claims finalizer delegation for post-fanout Stage 5 completion.
+    """
+    lease_token, worker_name = fencing
+    try:
+        result = job_manager.claim_finalizer(
+            inspection_id=inspection_id,
+            lease_token=lease_token,
+            worker_name=worker_name,
+            fanout_run_id=payload.fanout_run_id,
+            delegation_duration_sec=payload.delegation_duration_sec,
+        )
+    except KeyError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Inspection '{inspection_id}' not found.",
+        )
+    except LeaseConflictError as err:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(err),
+        )
+
+    return result
+
+
+@router.post("/jobs/{inspection_id}/finalizer/heartbeat")
+async def post_finalizer_heartbeat(
+    inspection_id: str,
+    payload: FinalizerHeartbeatRequest,
+    fencing: Tuple[int, str] = Depends(verify_fencing_headers),
+):
+    """
+    Renews finalizer delegation lease window.
+    """
+    lease_token, worker_name = fencing
+    try:
+        result = job_manager.apply_finalizer_heartbeat(
+            inspection_id=inspection_id,
+            lease_token=lease_token,
+            worker_name=worker_name,
+            delegation_token=payload.delegation_token,
+            finalizer_generation=payload.finalizer_generation,
+            extension_sec=payload.extension_sec,
+        )
+    except KeyError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Inspection '{inspection_id}' not found.",
+        )
+    except LeaseConflictError as err:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(err),
+        )
+
+    return result
+
+
+@router.get("/jobs/{inspection_id}/fanout/status")
+async def get_inspection_fanout_status(inspection_id: str):
+    """
+    Returns current fan-out state for an inspection.
+    """
+    fanout = job_manager.get_fanout_status(inspection_id)
+    if not fanout:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No fan-out state found for inspection '{inspection_id}'.",
+        )
+    return fanout

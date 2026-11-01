@@ -38,13 +38,24 @@ from app.pipeline.damage import (
     CrackClassifier,
     detect_damage,
     generate_tiles,
+    generate_tile_definitions,
+    extract_tile_crop,
+    classify_tile_batch,
+    aggregate_damage_findings,
+    DamageDetectionResult,
     merge_positive_tiles,
     estimate_box_center_3d,
     sort_findings,
     save_finding_crops,
     resolve_model_path,
 )
-from app.pipeline.runner import run_pipeline
+from app.pipeline.runner import (
+    run_pipeline,
+    run_pipeline_stages_0_to_3,
+    run_pipeline_stage_5,
+    Stage0to3Result,
+    PipelineExecutionResult,
+)
 from app.models.calibration import RectifiedStereoCalibration
 
 
@@ -522,3 +533,278 @@ def test_real_checkpoint_efficientnet_b0_compatibility():
     probs = clf.predict_batch([dummy_tile])
     assert len(probs) == 1
     assert 0.0 <= probs[0] <= 1.0
+
+
+# -----------------------------------------------------------------------------
+# Test 22: M4b Phase 1 Modular Tile Definitions and Crop Extraction
+# -----------------------------------------------------------------------------
+def test_modular_tile_definitions_and_crop_extraction():
+    """Validates deterministic tile definitions and extraction with reflect padding."""
+    h, w = 300, 400
+    img = np.zeros((h, w, 3), dtype=np.uint8)
+    for c in range(3):
+        img[:, :, c] = np.arange(w) % 256
+
+    dev_regions = [
+        {"id": "dev_001", "bbox": [50, 60, 150, 180], "area_px": 12000, "deviation_type": "dent"}
+    ]
+
+    defs1 = generate_tile_definitions(img.shape, dev_regions, tile_size=256, stride=128)
+    defs2 = generate_tile_definitions(img.shape, dev_regions, tile_size=256, stride=128)
+
+    # 1. Determinism
+    assert len(defs1) > 0
+    assert defs1 == defs2
+
+    # 2. Schema check
+    for idx, tdef in enumerate(defs1):
+        assert tdef["tile_index"] == idx
+        assert "bbox" in tdef and len(tdef["bbox"]) == 4
+        assert "crop_coords" in tdef and len(tdef["crop_coords"]) == 4
+        assert tdef["source"] in ("grid", "region")
+        assert "region" in tdef
+        assert "is_small_image" in tdef
+        assert tdef["is_small_image"] is False
+
+    # 3. Extraction check
+    for tdef in defs1:
+        crop = extract_tile_crop(img, tdef, tile_size=256)
+        assert crop.shape == (256, 256, 3)
+        assert crop.dtype == np.uint8
+
+    # 4. Small image case (< tile_size)
+    small_img = np.zeros((100, 120, 3), dtype=np.uint8)
+    small_defs = generate_tile_definitions(small_img.shape, [], tile_size=256)
+    assert len(small_defs) == 1
+    assert small_defs[0]["is_small_image"] is True
+    small_crop = extract_tile_crop(small_img, small_defs[0], tile_size=256)
+    assert small_crop.shape == (256, 256, 3)
+
+
+# -----------------------------------------------------------------------------
+# Test 23: M4b Phase 1 Modular Batch Classification and Finding Aggregation
+# -----------------------------------------------------------------------------
+def test_modular_classification_and_aggregation_matches_sequential(tmp_path: Path):
+    """
+    Verifies that the modular M4b execution path (definitions -> batch classification -> aggregation)
+    yields identical findings and statistics to the sequential detect_damage() pipeline.
+    """
+    h, w = 320, 240
+    img = np.full((h, w, 3), 120, dtype=np.uint8)
+    disparity = np.full((h, w), 25.0, dtype=np.float32)
+    intrinsics = {"fx": 500.0, "fy": 500.0, "cx": 120.0, "cy": 160.0, "baseline_mm": 120.0}
+
+    dev_regions = [
+        {"id": "dev_001", "bbox": [30, 40, 100, 120], "area_px": 5600, "deviation_type": "dent"}
+    ]
+
+    class MockClassifier:
+        def __init__(self):
+            self.status = "completed"
+            self.error = None
+            self.device = "cpu"
+            self.classes = ["Uncracked", "Cracked"]
+
+        def predict_batch(self, tiles, batch_size=16):
+            return [0.85 if idx % 2 == 0 else 0.15 for idx in range(len(tiles))]
+
+    mock_clf = MockClassifier()
+
+    # 1. Sequential run
+    seq_dir = tmp_path / "seq"
+    seq_dir.mkdir()
+    seq_res = detect_damage(
+        rectified_left_bgr=img,
+        deviation_regions=dev_regions,
+        disparity=disparity,
+        intrinsics=intrinsics,
+        tile=256,
+        threshold=0.5,
+        classifier=mock_clf,
+        job_dir=seq_dir,
+    )
+
+    # 2. Modular run
+    mod_dir = tmp_path / "mod"
+    mod_dir.mkdir()
+    tile_defs = generate_tile_definitions(img.shape, dev_regions, tile_size=256, stride=128)
+
+    batch_size = 2
+    all_probs = []
+    for i in range(0, len(tile_defs), batch_size):
+        batch = tile_defs[i:i + batch_size]
+        probs = classify_tile_batch(img, batch, mock_clf, batch_size=batch_size)
+        all_probs.extend(probs)
+
+    mod_res = aggregate_damage_findings(
+        deviation_regions=dev_regions,
+        tile_defs=tile_defs,
+        probabilities=all_probs,
+        disparity=disparity,
+        intrinsics=intrinsics,
+        threshold=0.5,
+        classifier_status=mock_clf.status,
+        classifier_error=mock_clf.error,
+        clf_device=mock_clf.device,
+        job_dir=mod_dir,
+        image_bgr=img,
+    )
+
+    # 3. Assert exact match
+    assert len(seq_res.findings) == len(mod_res.findings)
+    for sf, mf in zip(seq_res.findings, mod_res.findings):
+        assert sf.id == mf.id
+        assert sf.type == mf.type
+        assert sf.bounding_box_2d == mf.bounding_box_2d
+        if sf.confidence is not None:
+            assert pytest.approx(sf.confidence, rel=1e-4) == mf.confidence
+        else:
+            assert mf.confidence is None
+        assert sf.description == mf.description
+        assert sf.geometric_deviation_mm == mf.geometric_deviation_mm
+        assert sf.region_center_3d == mf.region_center_3d
+
+    assert seq_res.stats == mod_res.stats
+    assert seq_res.classifier_status == mod_res.classifier_status
+    assert seq_res.classifier_error == mod_res.classifier_error
+
+
+# -----------------------------------------------------------------------------
+# Test 24: M4b Phase 1 Fallback Modes in Aggregation
+# -----------------------------------------------------------------------------
+def test_modular_aggregation_fallback_modes(tmp_path: Path):
+    """Verifies that aggregate_damage_findings handles unavailable or failed classifier states."""
+    h, w = 320, 240
+    img = np.full((h, w, 3), 120, dtype=np.uint8)
+    disparity = np.full((h, w), 25.0, dtype=np.float32)
+    intrinsics = {"fx": 500.0, "fy": 500.0, "cx": 120.0, "cy": 160.0, "baseline_mm": 120.0}
+
+    dev_regions = [
+        {"id": "dev_001", "bbox": [30, 40, 100, 120], "area_px": 5600, "deviation_type": "dent"}
+    ]
+
+    tile_defs = generate_tile_definitions(img.shape, dev_regions, tile_size=256, stride=128)
+
+    # Case A: classifier unavailable
+    res_unavail = aggregate_damage_findings(
+        deviation_regions=dev_regions,
+        tile_defs=tile_defs,
+        probabilities=[],
+        disparity=disparity,
+        intrinsics=intrinsics,
+        threshold=0.5,
+        classifier_status="unavailable",
+        classifier_error="Checkpoint missing",
+        clf_device="cpu",
+        job_dir=tmp_path / "unavail",
+        image_bgr=img,
+    )
+
+    assert res_unavail.classifier_status == "unavailable"
+    assert res_unavail.classifier_error == "Checkpoint missing"
+    assert len(res_unavail.findings) == 1
+    assert res_unavail.findings[0].type == "surface_irregularity"
+    assert res_unavail.findings[0].confidence is None
+    assert "classifier unavailable" in res_unavail.findings[0].description
+    assert res_unavail.stats["tiles_evaluated"] == 0
+
+    # Case B: classifier failed with inference error
+    res_failed = aggregate_damage_findings(
+        deviation_regions=dev_regions,
+        tile_defs=tile_defs,
+        probabilities=[],
+        disparity=disparity,
+        intrinsics=intrinsics,
+        threshold=0.5,
+        classifier_status="failed",
+        classifier_error="Inference error: CUDA out of memory",
+        clf_device="cpu",
+        tiles_evaluated_count=len(tile_defs),
+        job_dir=tmp_path / "failed",
+        image_bgr=img,
+    )
+
+    assert res_failed.classifier_status == "failed"
+    assert "Inference error" in (res_failed.classifier_error or "")
+    assert len(res_failed.findings) == 1
+    assert res_failed.findings[0].type == "surface_irregularity"
+    assert res_failed.findings[0].confidence is None
+    assert "inference failed" in res_failed.findings[0].description
+    assert res_failed.stats["tiles_evaluated"] == len(tile_defs)
+
+
+# -----------------------------------------------------------------------------
+# Test 25: M4b Phase 1 Pipeline Stages 0-3 and Stage 5 Standalone Execution
+# -----------------------------------------------------------------------------
+def test_pipeline_stages_0_to_3_and_stage_5_standalone(synthetic_stereo_pair, tmp_path: Path):
+    """
+    Verifies that run_pipeline_stages_0_to_3 executes Stages 0-3 without invoking Stage 4,
+    and run_pipeline_stage_5 completes results packaging independently.
+    """
+    left_path = tmp_path / "left.png"
+    right_path = tmp_path / "right.png"
+    with open(left_path, "wb") as f:
+        f.write(synthetic_stereo_pair["left_bytes"])
+    with open(right_path, "wb") as f:
+        f.write(synthetic_stereo_pair["right_bytes"])
+
+    calib = RectifiedStereoCalibration(
+        baseline_distance_mm=120.0,
+        focal_length_px=500.0,
+        image_width=synthetic_stereo_pair["width"],
+        image_height=synthetic_stereo_pair["height"],
+    )
+
+    steps_recorded = []
+    def on_step(idx, step_id, status, msg=None):
+        steps_recorded.append((idx, step_id, status))
+
+    job_dir = tmp_path / "job_stages_0_3"
+    stage_0_3_res = run_pipeline_stages_0_to_3(
+        job_dir=job_dir,
+        left_image_path=left_path,
+        right_image_path=right_path,
+        calibration=calib,
+        on_step_change=on_step,
+    )
+
+    # 1. Stages 0-3 executed successfully
+    assert stage_0_3_res.success is True
+    assert stage_0_3_res.point_count > 0
+    assert stage_0_3_res.point_cloud_path is not None and stage_0_3_res.point_cloud_path.exists()
+    assert stage_0_3_res.disparity_path is not None and stage_0_3_res.disparity_path.exists()
+    assert stage_0_3_res.rectified_left_path is not None and stage_0_3_res.rectified_left_path.exists()
+    assert stage_0_3_res.deviations_json_path is not None and stage_0_3_res.deviations_json_path.exists()
+    assert stage_0_3_res.rectified_left is not None
+    assert stage_0_3_res.disparity is not None
+    assert stage_0_3_res.intrinsics is not None
+
+    # Verify Stage 4 was NOT executed in steps_recorded
+    stage_ids = [s[1] for s in steps_recorded]
+    assert "prepare" in stage_ids
+    assert "depth" in stage_ids
+    assert "surface" in stage_ids
+    assert "deviations" in stage_ids
+    assert "damage" not in stage_ids
+    assert "results" not in stage_ids
+
+    # 2. Stage 5 packaging runs independently
+    dummy_damage = DamageDetectionResult(
+        findings=[],
+        classifier_status="completed",
+        classifier_error=None,
+        stats={"tiles_total": 0, "tiles_evaluated": 0, "tiles_positive": 0},
+    )
+
+    final_res = run_pipeline_stage_5(
+        job_dir=job_dir,
+        stage_0_3_result=stage_0_3_res,
+        damage_result=dummy_damage,
+        on_step_change=on_step,
+    )
+
+    assert final_res.success is True
+    assert final_res.point_count == stage_0_3_res.point_count
+    assert final_res.findings == []
+    assert final_res.classifier_status == "completed"
+    assert "results" in [s[1] for s in steps_recorded]
