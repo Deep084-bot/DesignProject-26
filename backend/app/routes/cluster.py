@@ -97,7 +97,10 @@ async def get_cluster_summary():
             if insp is not None:
                 pings = insp.ping()
                 if pings is not None:
-                    online_workers = set(pings.keys())
+                    raw_online = set(pings.keys())
+                    online_workers = raw_online | {
+                        norm for w in raw_online if (norm := settings.normalize_worker_identity(w))
+                    }
                     inspect_succeeded = True
         except Exception:
             pass
@@ -111,7 +114,9 @@ async def get_cluster_summary():
                     if step.worker:
                         assigned_worker = step.worker
             if assigned_worker:
-                if mode == "celery" and inspect_succeeded and (assigned_worker not in online_workers):
+                assigned_norm = settings.normalize_worker_identity(assigned_worker)
+                is_online = (assigned_worker in online_workers) or (assigned_norm in online_workers if assigned_norm else False)
+                if mode == "celery" and inspect_succeeded and not is_online:
                     active_assignments[j.id] = f"{assigned_worker} (unresponsive)"
                 else:
                     active_assignments[j.id] = assigned_worker

@@ -8,7 +8,7 @@ Supports dynamic lookup so test monkeypatching is immediately reflected.
 
 import os
 import socket
-from typing import List
+from typing import List, Optional
 
 
 def get_execution_mode() -> str:
@@ -35,6 +35,17 @@ def get_worker_token() -> str:
 def get_worker_name() -> str:
     """Returns the worker identifier displayed in the UI (default: system hostname)."""
     return os.getenv("SURFACE_WORKER_NAME", socket.gethostname()).strip()
+
+
+def normalize_worker_identity(name: Optional[str]) -> Optional[str]:
+    """
+    Normalizes a Celery worker node name or configured worker identity to its canonical short identity.
+    Strips any '@hostname' domain suffix (e.g. 'worker-mac-1@hostname' -> 'worker-mac-1').
+    Returns None if the input is None or empty.
+    """
+    if not name or not str(name).strip():
+        return None
+    return str(name).strip().split("@", 1)[0].strip()
 
 
 def get_cors_origins() -> List[str]:

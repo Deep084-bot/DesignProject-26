@@ -775,6 +775,7 @@ def test_execute_worker_pipeline_end_to_end_mocked_http(tmp_path: Path, monkeypa
     """Executes full worker pipeline against test client, verifying manifest claim, artifacts upload, and completion."""
     monkeypatch.setenv("SURFACE_WORKER_TOKEN", "mock-worker-token")
     manager = JobManager(storage_dir=tmp_path / "jobs")
+    monkeypatch.setattr("backend.app.main.job_manager", manager)
     monkeypatch.setattr("backend.app.routes.internal.job_manager", manager)
     monkeypatch.setattr("backend.app.routes.inspections.job_manager", manager)
 
@@ -1715,6 +1716,7 @@ def test_actual_finalizer_execution_after_recovery_dispatch(tmp_path: Path, monk
     monkeypatch.setenv("SURFACE_MASTER_URL", "http://testserver")
 
     manager = JobManager(storage_dir=tmp_path / "jobs")
+    monkeypatch.setattr("backend.app.main.job_manager", manager)
     monkeypatch.setattr("backend.app.routes.internal.job_manager", manager)
     monkeypatch.setattr("backend.app.routes.inspections.job_manager", manager)
 

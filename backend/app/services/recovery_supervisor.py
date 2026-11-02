@@ -48,7 +48,10 @@ class RecoverySupervisor:
             if pings is None:
                 logger.warning("Recovery supervisor: Celery ping failed. Deferring cycle.")
                 return
-            online_workers: Set[str] = set(pings.keys())
+            raw_online: Set[str] = set(pings.keys())
+            online_workers: Set[str] = raw_online | {
+                norm for w in raw_online if (norm := settings.normalize_worker_identity(w))
+            }
         except Exception as exc:
             logger.warning(f"Recovery supervisor: Redis broker error ({exc}). Deferring recovery.")
             return
@@ -200,7 +203,8 @@ class RecoverySupervisor:
                 self._grace_periods.pop(job.id, None)
                 continue
 
-            is_online = job.assigned_worker in online_workers
+            assigned_norm = settings.normalize_worker_identity(job.assigned_worker)
+            is_online = (job.assigned_worker in online_workers) or (assigned_norm in online_workers if assigned_norm else False)
             heartbeat_age = self.job_manager.get_heartbeat_age(job.id)
             heartbeat_fresh = (heartbeat_age is not None and heartbeat_age <= lease_timeout)
 

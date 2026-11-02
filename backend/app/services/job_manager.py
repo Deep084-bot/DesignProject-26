@@ -196,11 +196,14 @@ class JobManager:
             raise LeaseConflictError(
                 f"Fencing lease token mismatch: job lease is {job.lease_token}, but request provided {lease_token}."
             )
-        if worker_name and job.assigned_worker and job.assigned_worker != worker_name:
-            raise LeaseConflictError(
-                f"Worker identity mismatch: job '{inspection_id}' is bound to worker '{job.assigned_worker}', "
-                f"but request came from '{worker_name}'."
-            )
+        if worker_name and job.assigned_worker:
+            assigned_norm = settings.normalize_worker_identity(job.assigned_worker)
+            req_norm = settings.normalize_worker_identity(worker_name)
+            if assigned_norm != req_norm:
+                raise LeaseConflictError(
+                    f"Worker identity mismatch: job '{inspection_id}' is bound to worker '{job.assigned_worker}', "
+                    f"but request came from '{worker_name}'."
+                )
 
     def _validate_batch_operation_locked(
         self,
@@ -271,10 +274,13 @@ class JobManager:
             )
         if fanout.delegation_token != delegation_token:
             raise LeaseConflictError("Finalizer delegation token mismatch or revoked.")
-        if fanout.finalizer_worker != worker_name:
-            raise LeaseConflictError(
-                f"Finalizer worker mismatch: delegated to '{fanout.finalizer_worker}', but request from '{worker_name}'."
-            )
+        if fanout.finalizer_worker and worker_name:
+            finalizer_norm = settings.normalize_worker_identity(fanout.finalizer_worker)
+            req_norm = settings.normalize_worker_identity(worker_name)
+            if finalizer_norm != req_norm:
+                raise LeaseConflictError(
+                    f"Finalizer worker mismatch: delegated to '{fanout.finalizer_worker}', but request from '{worker_name}'."
+                )
         if fanout.finalizer_generation != finalizer_generation:
             raise LeaseConflictError(
                 f"Finalizer generation mismatch: current generation is {fanout.finalizer_generation}, "
@@ -330,7 +336,8 @@ class JobManager:
         with self._lock:
             self._validate_lease_locked(inspection_id, lease_token, worker_name)
             job = self._jobs[inspection_id]
-            job.assigned_worker = worker_name
+            canonical_worker = settings.normalize_worker_identity(worker_name) or worker_name
+            job.assigned_worker = canonical_worker
             now_epoch = time.time()
             job.last_heartbeat_at = now_epoch
             self._monotonic_heartbeats[inspection_id] = time.monotonic()
@@ -1248,7 +1255,9 @@ class JobManager:
                     batch.claim_expires_at is not None
                     and (now_wall >= batch.claim_expires_at or (batch.claimed_at and now_wall < batch.claimed_at - 5.0))
                 )
-                if not is_expired and batch.claimed_by != worker_name:
+                claimed_norm = settings.normalize_worker_identity(batch.claimed_by)
+                req_norm = settings.normalize_worker_identity(worker_name)
+                if not is_expired and claimed_norm != req_norm:
                     rem_sec = max(0.0, batch.claim_expires_at - now_wall)
                     retry_after = min(10.0, max(3.0, rem_sec / 2.0))
                     return {
@@ -1426,7 +1435,7 @@ class JobManager:
                 is_expired = fanout.finalizer_expires_at is not None and now_wall > fanout.finalizer_expires_at
                 if is_expired:
                     fanout.finalizer_generation += 1
-                elif fanout.finalizer_worker != worker_name:
+                elif settings.normalize_worker_identity(fanout.finalizer_worker) != settings.normalize_worker_identity(worker_name):
                     raise LeaseConflictError(
                         f"Finalizer delegation is currently held by '{fanout.finalizer_worker}' "
                         f"until {fanout.finalizer_expires_at}."
@@ -1435,9 +1444,10 @@ class JobManager:
                 fanout.callback_arrived_at = now_wall
                 fanout.status = "FINALIZATION_RUNNING"
 
+            canonical_worker = settings.normalize_worker_identity(worker_name) or worker_name
             delegation_token = f"del_{uuid.uuid4().hex}"
             fanout.delegation_token = delegation_token
-            fanout.finalizer_worker = worker_name
+            fanout.finalizer_worker = canonical_worker
             fanout.finalizer_claimed_at = now_wall
             fanout.finalizer_expires_at = now_wall + delegation_duration_sec
 
@@ -1445,7 +1455,7 @@ class JobManager:
 
             job.fanout_status = "FINALIZATION_RUNNING"
             job.delegation_token = delegation_token
-            job.finalizer_worker = worker_name
+            job.finalizer_worker = canonical_worker
             job.finalizer_generation = fanout.finalizer_generation
             self._save_job_state(job)
 
@@ -1523,7 +1533,9 @@ class JobManager:
 
             if batch.state != "claimed":
                 raise LeaseConflictError(f"Batch {batch_id} is in state '{batch.state}', not claimed.")
-            if batch.claimed_by != worker_name:
+            claimed_norm = settings.normalize_worker_identity(batch.claimed_by)
+            req_norm = settings.normalize_worker_identity(worker_name)
+            if claimed_norm != req_norm:
                 raise LeaseConflictError(f"Batch {batch_id} is claimed by '{batch.claimed_by}', not '{worker_name}'.")
             if batch.claim_token != claim_token:
                 raise LeaseConflictError(f"Stale or mismatched claim token for batch {batch_id}.")
