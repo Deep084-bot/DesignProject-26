@@ -55,7 +55,7 @@ The verification harness (`scripts/verify_cluster_e2e.py`) launches genuinely se
 ./backend/venv/bin/python scripts/verify_cluster_e2e.py
 ```
 
-### Running with Recovery Verification (Two-Worker Takeover):
+### Running with Secondary Worker Test:
 ```bash
 ./backend/venv/bin/python scripts/verify_cluster_e2e.py --run-recovery
 ```
@@ -88,3 +88,45 @@ All subprocesses are launched in independent process groups. The harness uses a 
 * Subprocesses are gracefully terminated with `SIGTERM`.
 * Any stubborn process is forcibly terminated with `SIGKILL` after a 3-second grace period.
 * No orphan Uvicorn or Celery processes remain running.
+
+---
+
+## 6. Verification Results and Empirical Claims
+
+### 6.1 Backend Test Suite Breakdown
+
+All 147 backend tests pass cleanly (`147 passed, 2 warnings in 42.18s`):
+
+| Test Module | File | Tests | Status |
+|---|---|---|---|
+| API Inspections | `backend/tests/test_api_inspections.py` | 10 | PASS |
+| Calibration Validation | `backend/tests/test_calibration.py` | 6 | PASS |
+| Cluster Preflight | `backend/tests/test_cluster_preflight.py` | 11 | PASS |
+| Damage Classification | `backend/tests/test_damage.py` | 18 | PASS |
+| Deviation Analysis | `backend/tests/test_deviations.py` | 12 | PASS |
+| Distributed Coordination | `backend/tests/test_distributed.py` | **69** | PASS |
+| Mesh Reconstruction | `backend/tests/test_mesh_reconstruction.py` | 9 | PASS |
+| Stereo Pipeline | `backend/tests/test_stereo_pipeline.py` | 6 | PASS |
+| E2E Harness Unit Tests | `backend/tests/test_verify_cluster_e2e.py` | 6 | PASS |
+| **Total** | | **147** | **PASS (100%)** |
+
+*(Note: Earlier Phase 4.2 documentation mistakenly listed `test_distributed.py` as 65 tests due to a transcription typo; the exact collected and passing count is 69 tests, totaling 147 tests across the backend suite.)*
+
+### 6.2 Nature of Batch Execution (Sequential vs Concurrent)
+
+During the multi-process integration run:
+* The Celery worker was executed with `--pool=solo` (single-threaded concurrency 1).
+* The two tile batches (Batch 0: tiles 0–7; Batch 1: tiles 8–15) were executed **sequentially** by the worker process:
+  - Batch 0 was received at `09:40:58`, claimed, executed, and committed at `09:40:59`.
+  - Batch 1 was received at `09:40:59`, claimed, executed, and committed at `09:41:00`.
+* **Important Claim Clarification:** This run proves genuine Celery chord fanout, batch partitioning, HTTP artifact transfers, batch claiming, and batch committing against the master API. However, because the solo worker executed these batches serially, this test **does not demonstrate concurrent batch processing or parallel speedup**. True concurrent batch processing requires deploying multiple worker nodes or worker processes with `--pool=prefork` concurrency $\ge 2$.
+
+### 6.3 Secondary Worker Execution Scope (`--run-recovery`)
+
+The `--run-recovery` flag tests cluster behavior with two active worker processes (`worker-e2e-node1` and `worker-e2e-node2`):
+* When the secondary inspection (`INSP-2026-6D9A87`) was submitted to the shared Redis broker queue, Celery initially routed `run_inspection_task` directly to `worker-e2e-node2`.
+* `worker-e2e-node1` was stopped gracefully via `SIGTERM` while in an idle state.
+* `worker-e2e-node2` proceeded to execute and complete Stages 0 through 5 under its initial lease assignment (`lease_token: 1`, `finalizer_generation: 0`).
+* **Important Recovery Limitation:** **No mid-flight lease takeover or stale-worker fencing was demonstrated by this particular multi-process run.** Worker 1 did not crash while actively executing a lease, and Worker 2 did not perform a CAS lease reassignment from 1 to 2.
+* While mid-flight failure, lease expiration, worker fencing, outbox write-ahead logging, and supervisor recovery are thoroughly verified in the in-process distributed test suite (`backend/tests/test_distributed.py`, 69 tests), unit- and application-level test coverage is **not equivalent to a genuine OS-process failure integration test**. Genuine mid-flight OS process recovery remains a target for subsequent cluster validation on live VMs.
+
