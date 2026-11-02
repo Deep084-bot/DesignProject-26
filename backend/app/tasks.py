@@ -25,6 +25,7 @@ import cv2
 import httpx
 import numpy as np
 from celery import chord
+from celery.exceptions import Ignore, Retry
 
 from .celery_app import celery_app
 from .pipeline.calibration_parser import parse_calibration, CalibrationValidationError
@@ -615,7 +616,7 @@ def run_inspection_task(self, inspection_id: str, lease_token: int = 1):
                 calibration_model, calib_dict = parse_calibration(calib_bytes, image_width=wl, image_height=hl)
 
                 # Step notification callback
-                def on_step_change(idx, step_id, status, duration_sec=None, message=None):
+                def on_step_change(idx, step_id, status, message=None, duration_sec=None):
                     try:
                         client.post(
                             f"/api/internal/jobs/{inspection_id}/step",
@@ -634,12 +635,21 @@ def run_inspection_task(self, inspection_id: str, lease_token: int = 1):
 
                 # 3. Execute Stages 0-3
                 stage_res = run_pipeline_stages_0_to_3(
-                    left_bgr=left_img,
-                    right_bgr=right_img,
-                    calib_dict=calib_dict,
                     job_dir=temp_dir,
+                    left_image_path=local_left,
+                    right_image_path=local_right,
+                    calibration=calibration_model,
                     on_step_change=on_step_change,
                 )
+
+                if not stage_res.success:
+                    fail_payload = {
+                        "message": stage_res.failure_message or f"Stage {stage_res.failed_stage_index} failed",
+                        "failed_stage_index": stage_res.failed_stage_index,
+                        "worker": worker_name,
+                    }
+                    client.post(f"/api/internal/jobs/{inspection_id}/fail", headers=headers, json=fail_payload)
+                    return False
 
                 if abort_event.is_set():
                     raise LeaseRevokedException(f"Lease {lease_token} was revoked after stage 3 completion.")
@@ -668,8 +678,9 @@ def run_inspection_task(self, inspection_id: str, lease_token: int = 1):
                             _check_http_response(up_resp, inspection_id, lease_token)
 
                 # 5. Generate deterministic tile definitions and batch partitions
+                rect_shape = stage_res.rectified_left.shape if stage_res.rectified_left is not None else left_img.shape
                 all_tile_defs = generate_tile_definitions(
-                    image_shape=stage_res.left_bgr.shape,
+                    image_shape=rect_shape,
                     deviation_regions=stage_res.deviation_regions,
                     tile_size=settings.get_tile_size(),
                     stride=settings.get_tile_size(),
@@ -720,6 +731,8 @@ def run_inspection_task(self, inspection_id: str, lease_token: int = 1):
                 sig = chord(header, callback)
                 return self.replace(sig)
 
+    except (Ignore, Retry):
+        raise
     except LeaseRevokedException as rev_exc:
         logger.info(f"Coordinator task for inspection {inspection_id} cleanly aborted: {rev_exc}")
         return False

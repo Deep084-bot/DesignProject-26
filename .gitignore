@@ -46,3 +46,4 @@ backend/storage/jobs/*
 !backend/storage/jobs/.gitkeep
 backend/storage/*.lock
 backend/storage/.*.lock
+backend/storage/e2e_*
