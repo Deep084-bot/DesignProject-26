@@ -20,6 +20,7 @@ from fastapi.responses import FileResponse
 from ..models.inspection import InspectionResponse
 from ..pipeline.calibration_parser import parse_calibration, CalibrationValidationError
 from ..services.job_manager import job_manager
+from .. import settings
 
 
 router = APIRouter(prefix="/api/inspections", tags=["inspections"])
@@ -117,7 +118,7 @@ async def create_inspection(
     current_year = datetime.now(timezone.utc).year
     inspection_id = f"INSP-{current_year}-{unique_suffix}"
 
-    # 6. Create job and trigger background pipeline
+    # 6. Create job in storage
     inspection = job_manager.create_job(
         inspection_id=inspection_id,
         name=name.strip() or "Structural surface inspection",
@@ -131,6 +132,24 @@ async def create_inspection(
         calibration_summary=calibration_summary,
         raw_calibration_bytes=calib_bytes,
     )
+
+    # 7. In Celery mode, enqueue task to Celery / Redis using crash-safe outbox
+    if settings.get_execution_mode() == "celery":
+        try:
+            job_manager.write_outbox_intent(inspection_id, inspection.lease_token, previous_lease=0)
+            from ..tasks import run_inspection_task
+            run_inspection_task.delay(inspection_id, inspection.lease_token)
+            job_manager.mark_outbox_published(inspection_id, inspection.lease_token)
+            job_manager.cleanup_outbox(inspection_id, inspection.lease_token)
+        except Exception as exc:
+            job_manager.apply_failure(
+                inspection_id=inspection_id,
+                message=f"Failed to enqueue Celery task: {str(exc)}",
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Task queue unavailable: {str(exc)}",
+            )
 
     return inspection
 

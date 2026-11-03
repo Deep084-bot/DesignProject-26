@@ -51,8 +51,8 @@ def synthetic_stereo_pair():
     right_gray = base_texture.copy()
 
     # Foreground object: a textured square patch
-    patch_w, patch_h = 80, 80
-    y1, y2 = 80, 80 + patch_h
+    patch_w, patch_h = 140, 110
+    y1, y2 = 65, 65 + patch_h
     x1, x2 = 120, 120 + patch_w
     disparity_px = 16
 

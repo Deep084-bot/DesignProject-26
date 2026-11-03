@@ -6,6 +6,7 @@ import { NewInspectionPage } from './pages/NewInspectionPage';
 import { HistoryPage } from './pages/HistoryPage';
 import { InspectionDetailPage } from './pages/InspectionDetailPage';
 import { InspectionProgressPage } from './pages/InspectionProgressPage';
+import { NodesPage } from './pages/NodesPage';
 
 export const App: React.FC = () => {
   return (
@@ -17,6 +18,7 @@ export const App: React.FC = () => {
           <Route path="inspections" element={<HistoryPage />} />
           <Route path="inspections/:id" element={<InspectionDetailPage />} />
           <Route path="inspections/:id/progress" element={<InspectionProgressPage />} />
+          <Route path="nodes" element={<NodesPage />} />
 
           {/* Legacy & friendly redirects */}
           <Route path="history" element={<Navigate to="/inspections" replace />} />

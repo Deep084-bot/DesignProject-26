@@ -21,6 +21,8 @@ backend/venv/
 .env.*
 .env.local
 !.env.example
+!*.example
+!**/.env.*.example
 
 # Editors and operating-system files
 .DS_Store
@@ -42,3 +44,6 @@ pnpm-debug.log*
 # Generated processing outputs (preserve directory with .gitkeep)
 backend/storage/jobs/*
 !backend/storage/jobs/.gitkeep
+backend/storage/*.lock
+backend/storage/.*.lock
+backend/storage/e2e_*

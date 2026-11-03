@@ -10,6 +10,7 @@ watertight manifold triangular mesh with surface normals and transferred vertex 
 
 from pathlib import Path
 from typing import Dict, Any, Optional
+import os
 import logging
 import threading
 
@@ -21,6 +22,28 @@ _POISSON_LOCK = threading.Lock()
 # Resolve path to PointCloudToMesh/backend
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 _PCM_BACKEND = _REPO_ROOT / "PointCloudToMesh" / "backend"
+
+
+def get_surface_mesh_depth(default: int = 8) -> int:
+    """
+    Reads Poisson octree depth from SURFACE_MESH_DEPTH environment variable.
+    Defaults to 8 when unset or empty.
+
+    Raises:
+        ValueError: If SURFACE_MESH_DEPTH is not a valid positive integer.
+    """
+    val = os.environ.get("SURFACE_MESH_DEPTH")
+    if val is None or not val.strip():
+        return default
+    try:
+        parsed = int(val.strip())
+        if parsed <= 0:
+            raise ValueError(f"SURFACE_MESH_DEPTH must be a positive integer, got {parsed}")
+        return parsed
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid SURFACE_MESH_DEPTH '{val}'. Expected a positive integer (e.g. 6 to 10)."
+        ) from exc
 
 
 def _ensure_pcm_in_namespace():
@@ -38,7 +61,7 @@ def _ensure_pcm_in_namespace():
 def reconstruct_surface_mesh(
     point_cloud_ply_path: Path,
     output_mesh_ply_path: Path,
-    depth: int = 8,
+    depth: Optional[int] = None,
     density_trim_percent: float = 5.0,
     k_neighbors: int = 30,
     scale: float = 1.1,
@@ -81,6 +104,9 @@ def reconstruct_surface_mesh(
 
     input_path = Path(point_cloud_ply_path)
     output_path = Path(output_mesh_ply_path)
+
+    if depth is None:
+        depth = get_surface_mesh_depth(default=8)
 
     if not input_path.exists():
         raise FileNotFoundError(f"Point cloud file not found: {input_path}")

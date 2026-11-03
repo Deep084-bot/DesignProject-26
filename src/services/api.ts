@@ -15,7 +15,16 @@
  *   - Uses local browser session storage with clearly disclosed sample data and simulated progression.
  */
 
-import type { Inspection, NewInspectionInput, ExecutionMode, PipelineStep, Finding } from '../types/inspection';
+import type {
+  Inspection,
+  NewInspectionInput,
+  ExecutionMode,
+  PipelineStep,
+  Finding,
+  DeviationSummary,
+  ClusterWorkersResponse,
+  ClusterSummaryResponse,
+} from '../types/inspection';
 import { MOCK_INSPECTIONS, DEFAULT_PIPELINE_STEPS } from './mockData';
 
 // Configured base URL from Vite environment (e.g. "http://localhost:8000" or empty)
@@ -119,6 +128,22 @@ function normalizeFinding(f: any): Finding {
   };
 }
 
+function normalizeDeviationSummary(raw: any): DeviationSummary | null {
+  if (!raw || typeof raw !== 'object') return null;
+  return {
+    rmseMm: typeof raw.rmseMm === 'number' ? raw.rmseMm : raw.rmse_mm,
+    maxDepressionMm: typeof raw.maxDepressionMm === 'number' ? raw.maxDepressionMm : raw.max_depression_mm,
+    maxBulgeMm: typeof raw.maxBulgeMm === 'number' ? raw.maxBulgeMm : raw.max_bulge_mm,
+    sigmaMm: typeof raw.sigmaMm === 'number' ? raw.sigmaMm : raw.sigma_mm,
+    thresholdMm: typeof raw.thresholdMm === 'number' ? raw.thresholdMm : raw.threshold_mm,
+    inlierFraction: typeof raw.inlierFraction === 'number' ? raw.inlierFraction : raw.inlier_fraction,
+    regionCount: typeof raw.regionCount === 'number' ? raw.regionCount : raw.region_count,
+    planeNormal: raw.planeNormal || raw.plane_normal,
+    planeOffsetMm: typeof raw.planeOffsetMm === 'number' ? raw.planeOffsetMm : raw.plane_offset_mm,
+    validPixelFraction: typeof raw.validPixelFraction === 'number' ? raw.validPixelFraction : raw.valid_pixel_fraction,
+  };
+}
+
 export function normalizeInspection(data: any, forceDemoFlag?: boolean): Inspection {
   const currentStep =
     typeof data.current_step_index === 'number'
@@ -136,6 +161,8 @@ export function normalizeInspection(data: any, forceDemoFlag?: boolean): Inspect
       label: s.label,
       description: s.description || '',
       status: s.status || 'waiting',
+      worker: s.worker ?? null,
+      durationSec: typeof s.duration_sec === 'number' ? s.duration_sec : (typeof s.durationSec === 'number' ? s.durationSec : null),
     }));
   } else {
     steps = DEFAULT_PIPELINE_STEPS.map((s, idx) => {
@@ -151,7 +178,7 @@ export function normalizeInspection(data: any, forceDemoFlag?: boolean): Inspect
         else if (idx === currentStep) stepStatus = 'active';
         else stepStatus = 'waiting';
       }
-      return { ...s, status: stepStatus };
+      return { ...s, status: stepStatus, worker: null, durationSec: null };
     });
   }
 
@@ -167,8 +194,14 @@ export function normalizeInspection(data: any, forceDemoFlag?: boolean): Inspect
       ? Boolean(data.is_demo_mode)
       : false;
 
+  const inspectionId = data.id || `INSP-${Date.now()}`;
+  const rectifiedLeftCandidate =
+    data.rectifiedLeftUrl ||
+    data.rectified_left_url ||
+    (status === 'completed' && data.id ? `/api/inspections/${data.id}/artifacts/rectified_left.png` : undefined);
+
   return {
-    id: data.id || `INSP-${Date.now()}`,
+    id: inspectionId,
     name: data.name || 'Structural surface inspection',
     surfaceType: data.surfaceType || data.surface_type || 'Concrete surface',
     createdAt: data.createdAt || data.created_at || new Date().toISOString(),
@@ -204,6 +237,11 @@ export function normalizeInspection(data: any, forceDemoFlag?: boolean): Inspect
     triangleCount: data.triangleCount ?? data.triangle_count,
     meshStatus: data.meshStatus || data.mesh_status || (data.meshUrl || data.mesh_url ? 'completed' : undefined),
     meshError: data.meshError || data.mesh_error,
+    rectifiedLeftUrl: resolveArtifactUrl(rectifiedLeftCandidate) || resolveArtifactUrl(data.leftImage?.url || data.left_image?.url),
+    deviationSummary: normalizeDeviationSummary(data.deviationSummary || data.deviation_summary),
+    deviationHeatmapUrl: resolveArtifactUrl(data.deviationHeatmapUrl || data.deviation_heatmap_url),
+    classifierStatus: data.classifierStatus || data.classifier_status || null,
+    classifierError: data.classifierError || data.classifier_error || null,
     findings,
     isDemoMode: isDemo,
     failureMessage: data.failureMessage || data.failure_message,
@@ -520,4 +558,78 @@ export function updateInspectionProgress(
   all[index] = inspection;
   saveStoredDemoInspections(all);
   return inspection;
+}
+
+/**
+ * Queries cluster worker status from GET /api/cluster/workers.
+ * Falls back safely in demo mode or if cluster route returns local mode.
+ */
+export async function fetchClusterWorkers(): Promise<ClusterWorkersResponse> {
+  const currentMode = getExecutionMode();
+  if (currentMode === 'demo') {
+    return {
+      mode: 'local',
+      workers: [
+        {
+          name: 'demo-local-worker',
+          online: true,
+          activeJobs: [],
+          tasksDone: getStoredDemoInspections().length,
+        },
+      ],
+    };
+  }
+
+  const baseUrl = getBackendBaseUrl();
+  const url = `${baseUrl}/api/cluster/workers`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Failed to fetch cluster workers: HTTP ${res.status}`);
+  }
+  const data = await res.json();
+  return {
+    mode: (data.mode as 'local' | 'celery') || 'local',
+    workers: (data.workers || []).map((w: any) => ({
+      name: String(w.name || ''),
+      online: Boolean(w.online),
+      activeJobs: Array.isArray(w.active_jobs) ? w.active_jobs.map(String) : [],
+      tasksDone: Number(w.tasks_done || 0),
+    })),
+  };
+}
+
+/**
+ * Queries cluster job queue and execution summary from GET /api/cluster/summary.
+ */
+export async function fetchClusterSummary(): Promise<ClusterSummaryResponse> {
+  const currentMode = getExecutionMode();
+  if (currentMode === 'demo') {
+    const demoJobs = getStoredDemoInspections();
+    return {
+      mode: 'local',
+      totalJobs: demoJobs.length,
+      queued: demoJobs.filter((j) => j.status === 'queued').length,
+      processing: demoJobs.filter((j) => j.status === 'processing').length,
+      completed: demoJobs.filter((j) => j.status === 'completed').length,
+      failed: demoJobs.filter((j) => j.status === 'failed').length,
+      activeAssignments: {},
+    };
+  }
+
+  const baseUrl = getBackendBaseUrl();
+  const url = `${baseUrl}/api/cluster/summary`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Failed to fetch cluster summary: HTTP ${res.status}`);
+  }
+  const data = await res.json();
+  return {
+    mode: (data.mode as 'local' | 'celery') || 'local',
+    totalJobs: Number(data.total_jobs || 0),
+    queued: Number(data.queued || 0),
+    processing: Number(data.processing || 0),
+    completed: Number(data.completed || 0),
+    failed: Number(data.failed || 0),
+    activeAssignments: data.active_assignments || {},
+  };
 }

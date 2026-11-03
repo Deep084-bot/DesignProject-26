@@ -28,6 +28,19 @@ export interface Finding {
   regionCenter3D?: [number, number, number];
 }
 
+export interface DeviationSummary {
+  rmseMm?: number;
+  maxDepressionMm?: number;
+  maxBulgeMm?: number;
+  sigmaMm?: number;
+  thresholdMm?: number;
+  inlierFraction?: number;
+  regionCount?: number;
+  planeNormal?: [number, number, number];
+  planeOffsetMm?: number;
+  validPixelFraction?: number;
+}
+
 export interface CalibrationSummary {
   fileName: string;
   baselineDistanceMm?: number;
@@ -42,6 +55,8 @@ export interface PipelineStep {
   label: string;
   description: string;
   status: 'waiting' | 'active' | 'completed' | 'failed';
+  worker?: string | null;
+  durationSec?: number | null;
 }
 
 export interface ImageFileMeta {
@@ -70,6 +85,11 @@ export interface Inspection {
   triangleCount?: number;
   meshStatus?: 'completed' | 'failed' | 'unavailable';
   meshError?: string;
+  rectifiedLeftUrl?: string;
+  deviationSummary?: DeviationSummary | null;
+  deviationHeatmapUrl?: string | null;
+  classifierStatus?: 'completed' | 'unavailable' | 'failed' | null;
+  classifierError?: string | null;
   findings: Finding[];
   isDemoMode: boolean; // Transparent disclosure when offline or displaying sample inspections
   failureMessage?: string;
@@ -83,3 +103,26 @@ export interface NewInspectionInput {
   rightImageFile: File | null;
   calibrationFile: File | null;
 }
+
+export interface ClusterWorker {
+  name: string;
+  online: boolean;
+  activeJobs: string[];
+  tasksDone: number;
+}
+
+export interface ClusterWorkersResponse {
+  mode: 'local' | 'celery';
+  workers: ClusterWorker[];
+}
+
+export interface ClusterSummaryResponse {
+  mode: 'local' | 'celery';
+  totalJobs: number;
+  queued: number;
+  processing: number;
+  completed: number;
+  failed: number;
+  activeAssignments: Record<string, string>;
+}
+

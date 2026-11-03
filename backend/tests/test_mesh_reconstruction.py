@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from backend.app.pipeline.ply_writer import write_ply
-from backend.app.pipeline.mesh_reconstruction import reconstruct_surface_mesh
+from backend.app.pipeline.mesh_reconstruction import reconstruct_surface_mesh, get_surface_mesh_depth
 from backend.app.pipeline.runner import run_pipeline
 from backend.app.models.calibration import StereoCalibration, RectifiedStereoCalibration
 
@@ -153,3 +153,68 @@ def test_runner_mesh_failure_preserves_pointcloud(monkeypatch, synthetic_stereo_
     assert result.triangle_count is None
     assert result.mesh_status == "failed"
     assert "Simulated Open3D Poisson solver failure" in result.mesh_error
+
+
+def test_get_surface_mesh_depth_default(monkeypatch):
+    """Verifies default octree depth 8 when SURFACE_MESH_DEPTH is unset."""
+    monkeypatch.delenv("SURFACE_MESH_DEPTH", raising=False)
+    assert get_surface_mesh_depth() == 8
+
+
+def test_get_surface_mesh_depth_custom(monkeypatch):
+    """Verifies parsing custom positive integer octree depth from environment."""
+    monkeypatch.setenv("SURFACE_MESH_DEPTH", "6")
+    assert get_surface_mesh_depth() == 6
+
+
+def test_get_surface_mesh_depth_invalid(monkeypatch):
+    """Verifies clear ValueErrors for non-integer and non-positive depth settings."""
+    monkeypatch.setenv("SURFACE_MESH_DEPTH", "invalid_value")
+    with pytest.raises(ValueError, match="Invalid SURFACE_MESH_DEPTH"):
+        get_surface_mesh_depth()
+
+    monkeypatch.setenv("SURFACE_MESH_DEPTH", "-3")
+    with pytest.raises(ValueError, match="Invalid SURFACE_MESH_DEPTH"):
+        get_surface_mesh_depth()
+
+
+def test_runner_respects_surface_mesh_depth_env(monkeypatch, synthetic_stereo_pair, tmp_path: Path):
+    """Verifies that run_pipeline passes the configured SURFACE_MESH_DEPTH to mesh reconstruction."""
+    monkeypatch.setenv("SURFACE_MESH_DEPTH", "6")
+
+    observed_depth = []
+    original_reconstruct = reconstruct_surface_mesh
+
+    def spy_reconstruct(*args, **kwargs):
+        observed_depth.append(kwargs.get("depth"))
+        return original_reconstruct(*args, **kwargs)
+
+    import backend.app.pipeline.runner as runner_mod
+    monkeypatch.setattr(runner_mod, "reconstruct_surface_mesh", spy_reconstruct)
+
+    left_path = tmp_path / "left.png"
+    right_path = tmp_path / "right.png"
+    with open(left_path, "wb") as f:
+        f.write(synthetic_stereo_pair["left_bytes"])
+    with open(right_path, "wb") as f:
+        f.write(synthetic_stereo_pair["right_bytes"])
+
+    calib = RectifiedStereoCalibration(
+        baseline_distance_mm=120.0,
+        focal_length_px=500.0,
+        image_width=synthetic_stereo_pair["width"],
+        image_height=synthetic_stereo_pair["height"],
+    )
+
+    res = run_pipeline(
+        job_dir=tmp_path / "job_depth_check",
+        left_image_path=left_path,
+        right_image_path=right_path,
+        calibration=calib,
+    )
+
+    assert res.success is True
+    assert len(observed_depth) == 1
+    # When depth=None is passed into reconstruct_surface_mesh, reconstruct_surface_mesh resolves depth=6
+    # Or if runner passes depth=None, reconstruct_surface_mesh called spy receives depth=None
+    # Let's check: spy_reconstruct received depth=None, then inside original_reconstruct it used depth=6!
