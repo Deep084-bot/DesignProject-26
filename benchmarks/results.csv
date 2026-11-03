@@ -1,0 +1,2 @@
+timestamp,workers_online,jobs,wall_seconds,avg_job_seconds,jobs_per_minute,failures
+2026-11-03T10:16:41.475761+00:00,2,8,203.377,25.422,2.36,0
