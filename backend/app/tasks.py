@@ -231,7 +231,14 @@ class FinalizerHeartbeatThread(threading.Thread):
         self.stop_event = stop_event
         self.interval = interval
 
-    def run(self):
+    def _pulse(self) -> bool:
+        """
+        Sends an authenticated finalizer heartbeat pulse to master under delegation fencing.
+        WHY: Factored out to pulse immediately on thread start before sleeping, ensuring
+        finalizer_expires_at is durably extended on master before compute or aggregation begins.
+        Returns True if successful, False on HTTP error or network failure.
+        Sets abort_event and returns False if 409 Conflict (delegation revoked).
+        """
         headers = {
             "X-Worker-Token": self.worker_token,
             "X-Lease-Token": str(self.lease_token),
@@ -243,29 +250,44 @@ class FinalizerHeartbeatThread(threading.Thread):
             "finalizer_generation": self.finalizer_generation,
             "extension_sec": 30.0,
         }
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                resp = client.post(url, headers=headers, json=payload)
+                if resp.status_code == 409:
+                    logger.warning(
+                        f"Finalizer heartbeat received 409 Conflict for job {self.inspection_id} "
+                        f"(gen {self.finalizer_generation}). Delegation revoked. Signaling abort."
+                    )
+                    self.abort_event.set()
+                    return False
+                elif resp.status_code >= 400:
+                    logger.warning(f"Finalizer heartbeat HTTP error {resp.status_code}: {resp.text}")
+                    return False
+                return True
+        except Exception as exc:
+            logger.warning(f"Finalizer heartbeat error for job {self.inspection_id}: {exc}")
+            return False
+
+    def run(self):
+        # 1. Immediate initial pulse on start to refresh finalizer expiration window
+        if not self.stop_event.is_set() and not self.abort_event.is_set():
+            if not self._pulse() and self.abort_event.is_set():
+                return
+
+        # 2. Periodic heartbeat loop
+        slice_sec = min(0.5, max(0.01, self.interval / 2))
         while not self.stop_event.is_set() and not self.abort_event.is_set():
             start_wait = time.monotonic()
             while (time.monotonic() - start_wait) < self.interval:
                 if self.stop_event.is_set() or self.abort_event.is_set():
                     return
-                time.sleep(0.5)
+                time.sleep(slice_sec)
 
             if self.stop_event.is_set() or self.abort_event.is_set():
                 return
 
-            try:
-                with httpx.Client(timeout=10.0) as client:
-                    resp = client.post(url, headers=headers, json=payload)
-                    if resp.status_code == 409:
-                        logger.warning(
-                            f"Finalizer heartbeat 409 Conflict for job {self.inspection_id}. Aborting."
-                        )
-                        self.abort_event.set()
-                        return
-                    elif resp.status_code >= 400:
-                        logger.warning(f"Finalizer heartbeat HTTP error {resp.status_code}: {resp.text}")
-            except Exception as exc:
-                logger.warning(f"Finalizer heartbeat error: {exc}")
+            if not self._pulse() and self.abort_event.is_set():
+                return
 
 
 def _check_http_response(resp: httpx.Response, inspection_id: str, lease_token: int):
@@ -1028,7 +1050,7 @@ def finalize_inspection_task(
             if disp_resp.status_code == 200:
                 disparity = np.load(io.BytesIO(disp_resp.content))
 
-            m_resp = client.get(f"{master_url}/api/internal/jobs/{inspection_id}/manifest", headers=finalizer_headers)
+            m_resp = client.get(f"{master_url}/api/inspections/{inspection_id}")
             m_resp.raise_for_status()
             manifest = m_resp.json()
 
@@ -1107,8 +1129,8 @@ def finalize_inspection_task(
 
         # 8. Complete inspection
         complete_payload = {
-            "point_count": manifest.get("point_count", 0),
-            "mesh_status": manifest.get("mesh_status", "completed"),
+            "point_count": manifest.get("point_count") or 0,
+            "mesh_status": manifest.get("mesh_status") or "completed",
             "mesh_error": manifest.get("mesh_error"),
             "triangle_count": manifest.get("triangle_count"),
             "deviation_summary": deviation_summary,
