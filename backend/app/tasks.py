@@ -79,14 +79,46 @@ class WorkerHeartbeatThread(threading.Thread):
         self.abort_event = abort_event
         self.stop_event = stop_event
 
-    def run(self):
+    def _pulse(self) -> bool:
+        """
+        Sends an authenticated heartbeat pulse to the master under current fencing headers.
+        WHY: Factored out to execute an immediate initial pulse upon thread start as well as
+        periodic interval pulses, ensuring last_heartbeat_at is refreshed on the master before
+        compute-intensive pipeline stages begin.
+        Returns True if successful, False on HTTP error or network failure.
+        Sets abort_event and returns False if 409 Conflict (lease revoked).
+        """
         headers = {
             "X-Worker-Token": self.worker_token,
             "X-Lease-Token": str(self.lease_token),
             "X-Worker-Name": self.worker_name,
         }
         url = f"{self.master_url}/api/internal/jobs/{self.inspection_id}/heartbeat"
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                resp = client.post(url, headers=headers)
+                if resp.status_code == 409:
+                    logger.warning(
+                        f"Heartbeat received 409 Conflict for job {self.inspection_id} "
+                        f"(lease {self.lease_token}). Lease revoked. Signaling abort."
+                    )
+                    self.abort_event.set()
+                    return False
+                elif resp.status_code >= 400:
+                    logger.warning(f"Heartbeat HTTP error {resp.status_code}: {resp.text}")
+                    return False
+                return True
+        except Exception as exc:
+            logger.warning(f"Heartbeat network error for job {self.inspection_id}: {exc}")
+            return False
 
+    def run(self):
+        # 1. Immediate initial pulse on start to ensure master records fresh activity
+        if not self.stop_event.is_set() and not self.abort_event.is_set():
+            if not self._pulse() and self.abort_event.is_set():
+                return
+
+        # 2. Periodic heartbeat loop
         while not self.stop_event.is_set() and not self.abort_event.is_set():
             # Wait for interval in small slices to respond promptly to stop_event
             start_wait = time.monotonic()
@@ -98,20 +130,8 @@ class WorkerHeartbeatThread(threading.Thread):
             if self.stop_event.is_set() or self.abort_event.is_set():
                 return
 
-            try:
-                with httpx.Client(timeout=10.0) as client:
-                    resp = client.post(url, headers=headers)
-                    if resp.status_code == 409:
-                        logger.warning(
-                            f"Heartbeat received 409 Conflict for job {self.inspection_id} "
-                            f"(lease {self.lease_token}). Lease revoked. Signaling abort."
-                        )
-                        self.abort_event.set()
-                        return
-                    elif resp.status_code >= 400:
-                        logger.warning(f"Heartbeat HTTP error {resp.status_code}: {resp.text}")
-            except Exception as exc:
-                logger.warning(f"Heartbeat network error for job {self.inspection_id}: {exc}")
+            if not self._pulse() and self.abort_event.is_set():
+                return
 
 
 class BatchHeartbeatThread(threading.Thread):

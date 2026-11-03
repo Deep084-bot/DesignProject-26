@@ -209,13 +209,26 @@ class RecoverySupervisor:
             heartbeat_fresh = (heartbeat_age is not None and heartbeat_age <= lease_timeout)
 
             # Decision Table Evaluation
+            # Invariant: A missing Celery control ping alone must NEVER cause coordinator lease reassignment
+            # while the application heartbeat is fresh (<= lease_timeout).
             if is_online and heartbeat_fresh:
-                # 1. Healthy assignment
+                # 1. Healthy assignment: worker responsive to ping and heartbeat fresh
                 self._grace_periods.pop(job.id, None)
                 continue
 
+            elif not is_online and heartbeat_fresh:
+                # 2. Worker is CPU-busy (e.g. solo pool) or transient ping drop, but heartbeat is fresh.
+                # Retain assignment, clear any stale grace period, and do not trigger CAS reassignment.
+                self._grace_periods.pop(job.id, None)
+                logger.debug(
+                    f"Job {job.id}: Worker '{job.assigned_worker}' not in Celery ping response, "
+                    f"but heartbeat is fresh ({heartbeat_age}s <= {lease_timeout}s). Assignment retained."
+                )
+                continue
+
             elif is_online and not heartbeat_fresh:
-                # 2. Worker process online but task is silent/hung
+                # 3. Worker process online in Celery ping, but task heartbeat is expired (> lease_timeout).
+                # Task is potentially silent/hung. Apply bounded recovery grace period before taking over.
                 if job.id not in self._grace_periods:
                     self._grace_periods[job.id] = now_mono
                     logger.info(
@@ -226,20 +239,8 @@ class RecoverySupervisor:
                 elif (now_mono - self._grace_periods[job.id]) < grace_threshold:
                     continue
 
-            elif not is_online and heartbeat_fresh:
-                # 3. Transient ping drop
-                if job.id not in self._grace_periods:
-                    self._grace_periods[job.id] = now_mono
-                    logger.info(
-                        f"Worker '{job.assigned_worker}' for job {job.id} is offline "
-                        f"with fresh heartbeat ({heartbeat_age}s). Grace period started."
-                    )
-                    continue
-                elif (now_mono - self._grace_periods[job.id]) < grace_threshold:
-                    continue
-
             else:
-                # 4. Worker is offline AND heartbeat expired -> Immediate recovery
+                # 4. Worker is offline AND heartbeat expired (> lease_timeout) -> Authoritative lease expired
                 logger.info(
                     f"Worker '{job.assigned_worker}' offline and heartbeat expired "
                     f"for job {job.id}. Eligible for immediate recovery."

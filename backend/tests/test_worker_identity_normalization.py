@@ -150,7 +150,9 @@ def test_supervisor_retains_healthy_worker_with_exact_short_name(clean_job_manag
 def test_supervisor_distinguishes_assigned_worker_from_other_online_workers(clean_job_manager, monkeypatch):
     """
     When worker-mac-1 is assigned to a job, but only worker-mac-2 pings,
-    supervisor recognizes that worker-mac-1 is genuinely offline.
+    supervisor recognizes that worker-mac-1 is missing from ping list.
+    Under the recovery reliability invariant, if heartbeat is fresh,
+    assignment is retained without starting an offline grace period.
     """
     async def _run():
         manager, job = clean_job_manager
@@ -168,9 +170,10 @@ def test_supervisor_distinguishes_assigned_worker_from_other_online_workers(clea
         with patch("backend.app.celery_app.celery_app.control.inspect", return_value=mock_insp):
             await supervisor.check_recovery_cycle()
 
-        # Worker-mac-1 is offline with fresh heartbeat -> enters grace period
-        assert job.id in supervisor._grace_periods
+        # Worker-mac-1 is missing from ping with fresh heartbeat -> retains assignment, no grace period
+        assert job.id not in supervisor._grace_periods
         assert manager.get_job(job.id).lease_token == 1
+        assert manager.get_job(job.id).assigned_worker == "worker-mac-1"
 
     asyncio.run(_run())
 
